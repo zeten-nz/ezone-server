@@ -1,22 +1,35 @@
 {
-  "name": "stag-backend",
+  "name": "ezone-api",
   "version": "1.0.0",
-  "description": "STAG Warranty Management System Backend",
+  "description": "EZONE Warranty Management System — Production API",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js",
+    "dev": "NODE_ENV=development node server.js",
+    "pm2:start": "pm2 start ecosystem.config.js --env production",
+    "pm2:reload": "pm2 reload ecosystem.config.js --env production",
+    "pm2:stop": "pm2 stop ezone-api",
+    "pm2:logs": "pm2 logs ezone-api",
+    "pm2:status": "pm2 status",
+    "create-admin": "node create-admin.js",
     "reset": "node reset-database.js"
   },
   "type": "commonjs",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "dependencies": {
     "bcryptjs": "^2.4.3",
+    "compression": "^1.8.1",
     "cors": "^2.8.5",
     "dotenv": "^16.0.3",
     "exceljs": "^3.4.0",
     "express": "^4.18.2",
+    "express-rate-limit": "^8.5.2",
     "express-validator": "^7.0.0",
+    "helmet": "^8.2.0",
     "jsonwebtoken": "^9.0.0",
+    "morgan": "^1.11.0",
     "mysql2": "^3.6.0"
   }
 }
