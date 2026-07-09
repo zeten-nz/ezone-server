@@ -8,9 +8,54 @@ const getDateRangeFilter = (days) => {
   return date.toISOString().split('T')[0];
 };
 
-const exportWarrantyForms = async (req, res) => {
+// Excel exports are binary file streams, not JSON — they can't go through the
+// same errorCode/translations mechanism as the rest of the API. This is the
+// one place the backend needs to know the caller's language, passed as a
+// plain query param (the calling page already has it via useLanguage()).
+const getLang = (req) => (req.query.lang === 'ru' ? 'ru' : 'uz');
+
+// Single bilingual source for every column label used across all 3 export
+// functions — replaces what used to be 3 separate hardcoded English arrays.
+const EXCEL_FIELD_LABELS = {
+  id:             { uz: 'ID',                 ru: 'ID' },
+  employee:       { uz: 'Xodim',              ru: 'Сотрудник' },
+  region:         { uz: 'Viloyat',            ru: 'Область' },
+  city:           { uz: 'Shahar',             ru: 'Город' },
+  district:       { uz: 'Tuman',              ru: 'Район' },
+  organization:   { uz: 'Tashkilot',          ru: 'Организация' },
+  orgPhone:       { uz: 'Telefon',            ru: 'Телефон' },
+  installer:      { uz: "O'rnatuvchi",        ru: 'Установщик' },
+  warrantyNumber: { uz: 'Kafolat №',          ru: 'Гарантия №' },
+  date:           { uz: 'Sana',               ru: 'Дата' },
+  brand:          { uz: 'Brend',              ru: 'Марка' },
+  model:          { uz: 'Model',              ru: 'Модель' },
+  year:           { uz: 'Yil',                ru: 'Год' },
+  plate:          { uz: 'Raqam',              ru: 'Номер' },
+  vin:            { uz: 'VIN',                ru: 'VIN' },
+  engineVol:      { uz: 'Dvigatel hajmi',     ru: 'Объем двиг.' },
+  power:          { uz: 'Quvvat',             ru: 'Мощность' },
+  mileage:        { uz: 'Probeg',             ru: 'Пробег' },
+  owner:          { uz: 'Egasi',              ru: 'Владелец' },
+  ownerPhone:     { uz: 'Telefon',            ru: 'Телефон' },
+  reducerType:    { uz: 'Redyuktor turi',     ru: 'Тип редуктора' },
+  reducer:        { uz: 'Redyuktor',          ru: 'Редуктор' },
+  reducerSerial:  { uz: 'Seriya',             ru: 'Серия' },
+  cylinderType:   { uz: 'Tsilindr turi',      ru: 'Тип цилиндра' },
+  cylinder:       { uz: 'Tsilindr',           ru: 'Цилиндр' },
+  cylinderSerial: { uz: 'Seriya',             ru: 'Серия' },
+  stag:           { uz: 'STAG',               ru: 'STAG' },
+  stagSerial:     { uz: 'Seriya',             ru: 'Серия' },
+  injector:       { uz: 'Injektor',           ru: 'Инжектор' },
+  injectorSerial: { uz: 'Seriya',             ru: 'Серия' },
+  branch:         { uz: 'Filial',             ru: 'Филиал' },
+};
+
+const buildHeaders = (keys, lang) => keys.map((key) => EXCEL_FIELD_LABELS[key][lang]);
+
+const exportWarrantyForms = async (req, res, next) => {
   try {
     const { days } = req.query;
+    const lang = getLang(req);
     const dateFilter = getDateRangeFilter(days);
 
     const connection = await pool.getConnection();
@@ -32,18 +77,17 @@ const exportWarrantyForms = async (req, res) => {
     connection.release();
 
     const workbook = new ExcelJS.Workbook();
-    const worksheet = workbook.addWorksheet('Warranty Forms');
+    const worksheet = workbook.addWorksheet(lang === 'ru' ? 'Гарантийные формы' : 'Kafolat daftarlari');
 
-    // Headers
-    const headers = [
-      'ID', 'Employee', 'Region', 'City', 'District', 'Organization', 'Phone',
-      'Installer', 'Warranty #', 'Date', 'Brand', 'Model', 'Year',
-      'Plate', 'VIN', 'Engine Vol', 'Power', 'Mileage', 'Owner', 'Phone',
-      'Reducer Type', 'Reducer', 'Serial', 'Cylinder Type', 'Cylinder',
-      'Serial', 'STAG', 'Serial', 'Injector', 'Serial', 'Branch'
+    const columnKeys = [
+      'id', 'employee', 'region', 'city', 'district', 'organization', 'orgPhone',
+      'installer', 'warrantyNumber', 'date', 'brand', 'model', 'year',
+      'plate', 'vin', 'engineVol', 'power', 'mileage', 'owner', 'ownerPhone',
+      'reducerType', 'reducer', 'reducerSerial', 'cylinderType', 'cylinder',
+      'cylinderSerial', 'stag', 'stagSerial', 'injector', 'injectorSerial', 'branch',
     ];
 
-    const headerRow = worksheet.addRow(headers);
+    const headerRow = worksheet.addRow(buildHeaders(columnKeys, lang));
     headerRow.font = { bold: true, color: { argb: 'FFFFFFFF' }, size: 10 };
     headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1e3a8a' } };
     headerRow.alignment = { horizontal: 'center', vertical: 'center', wrapText: true };
@@ -52,12 +96,14 @@ const exportWarrantyForms = async (req, res) => {
     const columnWidths = [8, 14, 10, 10, 10, 14, 10, 12, 12, 12, 12, 12, 8, 11, 11, 11, 10, 10, 12, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 12];
     worksheet.columns = columnWidths.map(width => ({ width }));
 
+    const dateLocale = lang === 'ru' ? 'ru-RU' : 'uz-UZ';
+
     // Add data rows
     forms.forEach((form, idx) => {
       const row = worksheet.addRow([
         form.id, form.employee_name, form.region, form.city, form.district,
         form.organization_name, form.organization_phone, form.installer_full_name,
-        form.warranty_book_number, new Date(form.installation_date).toLocaleDateString('uz-UZ'),
+        form.warranty_book_number, new Date(form.installation_date).toLocaleDateString(dateLocale),
         form.vehicle_brand, form.vehicle_model, form.vehicle_production_year,
         form.vehicle_plate_number, form.vehicle_vin, form.vehicle_engine_volume,
         form.vehicle_engine_power, form.vehicle_mileage, form.owner_full_name,
@@ -87,14 +133,19 @@ const exportWarrantyForms = async (req, res) => {
 
     await workbook.xlsx.write(res);
   } catch (error) {
-    console.error('Export error:', error);
-    res.status(500).json({ message: 'Export error: ' + error.message });
+    console.error('Export warranty forms error:', error);
+    if (!res.headersSent) {
+      next(error);
+    } else {
+      res.end();
+    }
   }
 };
 
-const exportByBranch = async (req, res) => {
+const exportByBranch = async (req, res, next) => {
   try {
     const { branch, days } = req.query;
+    const lang = getLang(req);
     const dateFilter = getDateRangeFilter(days);
 
     const connection = await pool.getConnection();
@@ -120,32 +171,33 @@ const exportByBranch = async (req, res) => {
     const worksheet = workbook.addWorksheet(branch.substring(0, 31));
 
     // Title
-    const titleRow = worksheet.addRow([`Branch: ${branch}`]);
+    const titleRow = worksheet.addRow([`${lang === 'ru' ? 'Филиал' : 'Filial'}: ${branch}`]);
     titleRow.font = { bold: true, size: 12, color: { argb: 'FF1e3a8a' } };
     worksheet.addRow([]);
 
-    // Headers
-    const headers = [
-      'ID', 'Employee', 'Region', 'City', 'District', 'Organization', 'Phone',
-      'Installer', 'Warranty #', 'Date', 'Brand', 'Model', 'Year',
-      'Plate', 'VIN', 'Engine Vol', 'Power', 'Mileage', 'Owner', 'Phone',
-      'Reducer Type', 'Reducer', 'Serial', 'Cylinder Type', 'Cylinder',
-      'Serial', 'STAG', 'Serial', 'Injector', 'Serial'
+    const columnKeys = [
+      'id', 'employee', 'region', 'city', 'district', 'organization', 'orgPhone',
+      'installer', 'warrantyNumber', 'date', 'brand', 'model', 'year',
+      'plate', 'vin', 'engineVol', 'power', 'mileage', 'owner', 'ownerPhone',
+      'reducerType', 'reducer', 'reducerSerial', 'cylinderType', 'cylinder',
+      'cylinderSerial', 'stag', 'stagSerial', 'injector', 'injectorSerial',
     ];
 
-    const headerRow = worksheet.addRow(headers);
+    const headerRow = worksheet.addRow(buildHeaders(columnKeys, lang));
     headerRow.font = { bold: true, color: { argb: 'FFFFFFFF' }, size: 10 };
     headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1e3a8a' } };
 
     const columnWidths = [8, 14, 10, 10, 10, 14, 10, 12, 12, 12, 12, 12, 8, 11, 11, 11, 10, 10, 12, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10];
     worksheet.columns = columnWidths.map(width => ({ width }));
 
+    const dateLocale = lang === 'ru' ? 'ru-RU' : 'uz-UZ';
+
     // Add data rows
     forms.forEach((form, idx) => {
       const row = worksheet.addRow([
         form.id, form.employee_name, form.region, form.city, form.district,
         form.organization_name, form.organization_phone, form.installer_full_name,
-        form.warranty_book_number, new Date(form.installation_date).toLocaleDateString('uz-UZ'),
+        form.warranty_book_number, new Date(form.installation_date).toLocaleDateString(dateLocale),
         form.vehicle_brand, form.vehicle_model, form.vehicle_production_year,
         form.vehicle_plate_number, form.vehicle_vin, form.vehicle_engine_volume,
         form.vehicle_engine_power, form.vehicle_mileage, form.owner_full_name,
@@ -175,14 +227,19 @@ const exportByBranch = async (req, res) => {
 
     await workbook.xlsx.write(res);
   } catch (error) {
-    console.error('Export error:', error);
-    res.status(500).json({ message: 'Export error: ' + error.message });
+    console.error('Export by branch error:', error);
+    if (!res.headersSent) {
+      next(error);
+    } else {
+      res.end();
+    }
   }
 };
 
-const exportEmployeeData = async (req, res) => {
+const exportEmployeeData = async (req, res, next) => {
   try {
     const { employeeId, days } = req.query;
+    const lang = getLang(req);
     const dateFilter = getDateRangeFilter(days);
 
     const connection = await pool.getConnection();
@@ -194,7 +251,7 @@ const exportEmployeeData = async (req, res) => {
 
     if (empData.length === 0) {
       connection.release();
-      return res.status(404).json({ message: 'Employee not found' });
+      return res.status(404).json({ success: false, message: 'Employee not found', errorCode: 'NOT_FOUND', timestamp: new Date().toISOString() });
     }
 
     let query = `SELECT wf.*, u.full_name as employee_name
@@ -222,28 +279,29 @@ const exportEmployeeData = async (req, res) => {
     titleRow.font = { bold: true, size: 12, color: { argb: 'FF1e3a8a' } };
     worksheet.addRow([]);
 
-    // Headers
-    const headers = [
-      'ID', 'Region', 'City', 'District', 'Organization', 'Phone',
-      'Installer', 'Warranty #', 'Date', 'Brand', 'Model', 'Year',
-      'Plate', 'VIN', 'Engine Vol', 'Power', 'Mileage', 'Owner', 'Phone',
-      'Reducer Type', 'Reducer', 'Serial', 'Cylinder Type', 'Cylinder',
-      'Serial', 'STAG', 'Serial', 'Injector', 'Serial'
+    const columnKeys = [
+      'id', 'region', 'city', 'district', 'organization', 'orgPhone',
+      'installer', 'warrantyNumber', 'date', 'brand', 'model', 'year',
+      'plate', 'vin', 'engineVol', 'power', 'mileage', 'owner', 'ownerPhone',
+      'reducerType', 'reducer', 'reducerSerial', 'cylinderType', 'cylinder',
+      'cylinderSerial', 'stag', 'stagSerial', 'injector', 'injectorSerial',
     ];
 
-    const headerRow = worksheet.addRow(headers);
+    const headerRow = worksheet.addRow(buildHeaders(columnKeys, lang));
     headerRow.font = { bold: true, color: { argb: 'FFFFFFFF' }, size: 10 };
     headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1e3a8a' } };
 
     const columnWidths = [8, 10, 10, 10, 14, 10, 12, 12, 12, 12, 12, 8, 11, 11, 11, 10, 10, 12, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10];
     worksheet.columns = columnWidths.map(width => ({ width }));
 
+    const dateLocale = lang === 'ru' ? 'ru-RU' : 'uz-UZ';
+
     // Add data rows
     forms.forEach((form, idx) => {
       const row = worksheet.addRow([
         form.id, form.region, form.city, form.district,
         form.organization_name, form.organization_phone, form.installer_full_name,
-        form.warranty_book_number, new Date(form.installation_date).toLocaleDateString('uz-UZ'),
+        form.warranty_book_number, new Date(form.installation_date).toLocaleDateString(dateLocale),
         form.vehicle_brand, form.vehicle_model, form.vehicle_production_year,
         form.vehicle_plate_number, form.vehicle_vin, form.vehicle_engine_volume,
         form.vehicle_engine_power, form.vehicle_mileage, form.owner_full_name,
@@ -273,8 +331,12 @@ const exportEmployeeData = async (req, res) => {
 
     await workbook.xlsx.write(res);
   } catch (error) {
-    console.error('Export error:', error);
-    res.status(500).json({ message: 'Export error: ' + error.message });
+    console.error('Export employee data error:', error);
+    if (!res.headersSent) {
+      next(error);
+    } else {
+      res.end();
+    }
   }
 };
 

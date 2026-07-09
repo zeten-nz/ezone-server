@@ -57,6 +57,25 @@ const pool = mysql.createPool({
   charset: 'utf8mb4'
 });
 
+/**
+ * Adds `column` to `table` only if it doesn't already exist — the safe,
+ * portable way to evolve a table already deployed with CREATE TABLE IF NOT
+ * EXISTS (which does nothing once the table exists). `definition` is the
+ * full column clause (name + type + modifiers); both `table`/`column` here
+ * are always static strings we control, never request input.
+ */
+async function ensureColumn(connection, table, column, definition) {
+  const [rows] = await connection.execute(
+    `SELECT COUNT(*) AS count FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?`,
+    [table, column]
+  );
+  if (rows[0].count === 0) {
+    await connection.execute(`ALTER TABLE ${table} ADD COLUMN ${definition}`);
+    console.log(`[DB] Migration: added column ${table}.${column}`);
+  }
+}
+
 const initializeDatabase = async (loadMockData = false) => {
   let connection;
   try {
@@ -71,18 +90,37 @@ const initializeDatabase = async (loadMockData = false) => {
     // IF NOT EXISTS makes this idempotent — safe to run on every startup.
     await connection.execute(`
       CREATE TABLE IF NOT EXISTS users (
-        id          INT PRIMARY KEY AUTO_INCREMENT,
-        full_name   VARCHAR(255) NOT NULL,
-        username    VARCHAR(100) UNIQUE NOT NULL,
-        password    VARCHAR(255) NOT NULL,
-        phone       VARCHAR(20),
-        branch_code VARCHAR(100),
-        role        ENUM('ADMIN', 'EMPLOYEE') DEFAULT 'EMPLOYEE',
-        is_active   BOOLEAN DEFAULT TRUE,
-        created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        id             INT PRIMARY KEY AUTO_INCREMENT,
+        full_name      VARCHAR(255) NOT NULL,
+        first_name     VARCHAR(255) NULL,
+        last_name      VARCHAR(255) NULL,
+        username       VARCHAR(100) UNIQUE NOT NULL,
+        password       VARCHAR(255) NOT NULL,
+        phone          VARCHAR(20),
+        region         VARCHAR(100) NULL,
+        district       VARCHAR(100) NULL,
+        branch_code    VARCHAR(100),
+        photo_filename VARCHAR(255) NULL,
+        role           ENUM('ADMIN', 'EMPLOYEE') DEFAULT 'EMPLOYEE',
+        is_active      BOOLEAN DEFAULT TRUE,
+        last_login_at  TIMESTAMP NULL DEFAULT NULL,
+        created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
       ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
     `);
+
+    // Additive migration for databases created before first_name/last_name/
+    // region/district/photo_filename/last_login_at existed — CREATE TABLE IF
+    // NOT EXISTS above is a no-op once the table already exists, so an
+    // already-deployed `users` table needs these columns added explicitly.
+    // Checking information_schema first (rather than a bare ALTER) keeps this
+    // safely re-runnable on every startup without erroring on later runs.
+    await ensureColumn(connection, 'users', 'first_name', 'first_name VARCHAR(255) NULL AFTER full_name');
+    await ensureColumn(connection, 'users', 'last_name', 'last_name VARCHAR(255) NULL AFTER first_name');
+    await ensureColumn(connection, 'users', 'region', 'region VARCHAR(100) NULL AFTER phone');
+    await ensureColumn(connection, 'users', 'district', 'district VARCHAR(100) NULL AFTER region');
+    await ensureColumn(connection, 'users', 'photo_filename', 'photo_filename VARCHAR(255) NULL AFTER branch_code');
+    await ensureColumn(connection, 'users', 'last_login_at', 'last_login_at TIMESTAMP NULL DEFAULT NULL AFTER is_active');
 
     // Create warranty_forms table with FK to users
     await connection.execute(`
@@ -128,6 +166,35 @@ const initializeDatabase = async (loadMockData = false) => {
         updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 
         FOREIGN KEY (employee_id) REFERENCES users(id)
+      ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+    `);
+
+    // Create registration_requests table — new employee accounts start here,
+    // PENDING and with zero permissions, until an admin approves them (which
+    // is what actually creates the corresponding users row). Never grants
+    // login/API access on its own — see authController.login().
+    await connection.execute(`
+      CREATE TABLE IF NOT EXISTS registration_requests (
+        id             INT PRIMARY KEY AUTO_INCREMENT,
+        first_name     VARCHAR(255) NOT NULL,
+        last_name      VARCHAR(255) NOT NULL,
+        region         VARCHAR(100) NOT NULL,
+        district       VARCHAR(100) NOT NULL,
+        branch_code    VARCHAR(100) NOT NULL,
+        phone          VARCHAR(20)  NOT NULL,
+        username       VARCHAR(100) NOT NULL,
+        password_hash  VARCHAR(255) NOT NULL,
+        photo_filename VARCHAR(255) NOT NULL,
+        status         ENUM('PENDING', 'APPROVED', 'REJECTED') NOT NULL DEFAULT 'PENDING',
+        notes          TEXT,
+        reviewed_at    TIMESTAMP NULL DEFAULT NULL,
+        reviewed_by    INT NULL,
+        created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+        FOREIGN KEY (reviewed_by) REFERENCES users(id),
+        INDEX idx_registration_requests_username (username),
+        INDEX idx_registration_requests_status (status)
       ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
     `);
 

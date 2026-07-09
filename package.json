@@ -5,7 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "NODE_ENV=development node server.js",
+    "dev": "set NODE_ENV=development&& nodemon server.js",
     "pm2:start": "pm2 start ecosystem.config.js --env production",
     "pm2:reload": "pm2 reload ecosystem.config.js --env production",
     "pm2:stop": "pm2 stop ezone-api",
@@ -30,6 +30,7 @@
     "helmet": "^8.2.0",
     "jsonwebtoken": "^9.0.0",
     "morgan": "^1.11.0",
+    "multer": "^2.2.0",
     "mysql2": "^3.6.0"
   }
 }

@@ -5,6 +5,7 @@ const {
   createUser,
   updateUser,
   disableUser,
+  enableUser,
   resetPassword,
   getUser
 } = require('../controllers/userController');
@@ -33,6 +34,7 @@ router.put('/:userId', [
 ], updateUser);
 
 router.patch('/:userId/disable', disableUser);
+router.patch('/:userId/enable', enableUser);
 
 router.post('/:userId/reset-password', [
   body('newPassword').isLength({ min: 6 }).withMessage('Password must be at least 6 characters')

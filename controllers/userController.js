@@ -2,7 +2,7 @@ const bcrypt = require('bcryptjs');
 const { pool } = require('../config/database');
 const { validationResult } = require('express-validator');
 
-const getAllUsers = async (req, res) => {
+const getAllUsers = async (req, res, next) => {
   try {
     const connection = await pool.getConnection();
     const [users] = await connection.execute(
@@ -12,16 +12,15 @@ const getAllUsers = async (req, res) => {
 
     res.json(users);
   } catch (error) {
-    console.error('Get users error:', error);
-    res.status(500).json({ message: 'Server error' });
+    next(error);
   }
 };
 
-const createUser = async (req, res) => {
+const createUser = async (req, res, next) => {
   try {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
+      return res.status(400).json({ success: false, message: errors.array()[0].msg, errorCode: 'VALIDATION_ERROR', timestamp: new Date().toISOString() });
     }
 
     const { full_name, username, password, phone, branch_code } = req.body;
@@ -34,7 +33,7 @@ const createUser = async (req, res) => {
 
     if (existing.length > 0) {
       connection.release();
-      return res.status(400).json({ message: 'Username already exists' });
+      return res.status(409).json({ success: false, message: 'Username already exists', errorCode: 'CONFLICT', timestamp: new Date().toISOString() });
     }
 
     const hashedPassword = await bcrypt.hash(password, 10);
@@ -48,13 +47,17 @@ const createUser = async (req, res) => {
 
     res.status(201).json({ message: 'User created successfully' });
   } catch (error) {
-    console.error('Create user error:', error);
-    res.status(500).json({ message: 'Server error' });
+    next(error);
   }
 };
 
-const updateUser = async (req, res) => {
+const updateUser = async (req, res, next) => {
   try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, message: errors.array()[0].msg, errorCode: 'VALIDATION_ERROR', timestamp: new Date().toISOString() });
+    }
+
     const { userId } = req.params;
     const { full_name, phone, branch_code } = req.body;
 
@@ -69,37 +72,41 @@ const updateUser = async (req, res) => {
 
     res.json({ message: 'User updated successfully' });
   } catch (error) {
-    console.error('Update user error:', error);
-    res.status(500).json({ message: 'Server error' });
+    next(error);
   }
 };
 
-const disableUser = async (req, res) => {
+// Shared by disableUser/enableUser below — the only difference between the
+// two is the boolean they write, so this keeps that one real distinction in
+// one place instead of two near-identical copies of the same query/response.
+const setUserActive = (isActive) => async (req, res, next) => {
   try {
     const { userId } = req.params;
     const connection = await pool.getConnection();
 
     await connection.execute(
-      'UPDATE users SET is_active = FALSE WHERE id = ? AND role = ?',
-      [userId, 'EMPLOYEE']
+      'UPDATE users SET is_active = ? WHERE id = ? AND role = ?',
+      [isActive, userId, 'EMPLOYEE']
     );
 
     connection.release();
 
-    res.json({ message: 'User disabled successfully' });
+    res.json({ message: isActive ? 'User enabled successfully' : 'User disabled successfully' });
   } catch (error) {
-    console.error('Disable user error:', error);
-    res.status(500).json({ message: 'Server error' });
+    next(error);
   }
 };
 
-const resetPassword = async (req, res) => {
+const disableUser = setUserActive(false);
+const enableUser = setUserActive(true);
+
+const resetPassword = async (req, res, next) => {
   try {
     const { userId } = req.params;
     const { newPassword } = req.body;
 
     if (!newPassword) {
-      return res.status(400).json({ message: 'New password required' });
+      return res.status(400).json({ success: false, message: 'New password required', errorCode: 'BAD_REQUEST', timestamp: new Date().toISOString() });
     }
 
     const hashedPassword = await bcrypt.hash(newPassword, 10);
@@ -114,12 +121,11 @@ const resetPassword = async (req, res) => {
 
     res.json({ message: 'Password reset successfully' });
   } catch (error) {
-    console.error('Reset password error:', error);
-    res.status(500).json({ message: 'Server error' });
+    next(error);
   }
 };
 
-const getUser = async (req, res) => {
+const getUser = async (req, res, next) => {
   try {
     const { userId } = req.params;
     const connection = await pool.getConnection();
@@ -132,13 +138,12 @@ const getUser = async (req, res) => {
     connection.release();
 
     if (users.length === 0) {
-      return res.status(404).json({ message: 'User not found' });
+      return res.status(404).json({ success: false, message: 'User not found', errorCode: 'NOT_FOUND', timestamp: new Date().toISOString() });
     }
 
     res.json(users[0]);
   } catch (error) {
-    console.error('Get user error:', error);
-    res.status(500).json({ message: 'Server error' });
+    next(error);
   }
 };
 
@@ -147,6 +152,7 @@ module.exports = {
   createUser,
   updateUser,
   disableUser,
+  enableUser,
   resetPassword,
   getUser
 };

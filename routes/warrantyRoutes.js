@@ -2,16 +2,19 @@ const express = require('express');
 const { body } = require('express-validator');
 const {
   createWarrantyForm,
+  updateWarrantyForm,
   getAllWarrantyForms,
   getWarrantyFormDetail,
   deleteWarrantyForm,
-  searchWarrantyForms
+  searchWarrantyForms,
+  getMyWarrantyForms,
 } = require('../controllers/warrantyController');
 const { verifyToken, authorizeRole } = require('../middleware/auth');
 
 const router = express.Router();
 
-router.post('/', verifyToken, [
+// Shared validation rules reused by both POST (create) and PUT (update).
+const warrantyValidationRules = [
   body('region').notEmpty(),
   body('city').notEmpty(),
   body('district').notEmpty(),
@@ -39,15 +42,20 @@ router.post('/', verifyToken, [
   body('stag_controller_manufacturer').notEmpty(),
   body('stag_controller_serial_number').notEmpty(),
   body('injector_rail_manufacturer').notEmpty(),
-  body('injector_rail_serial_number').notEmpty()
-], createWarrantyForm);
+  body('injector_rail_serial_number').notEmpty(),
+];
 
+router.post('/', verifyToken, warrantyValidationRules, createWarrantyForm);
+
+// Literal-string routes must come before /:formId to avoid Express treating them as IDs.
 router.get('/search', verifyToken, authorizeRole('ADMIN'), searchWarrantyForms);
+router.get('/my',     verifyToken, getMyWarrantyForms);
 
-router.get('/', verifyToken, authorizeRole('ADMIN'), getAllWarrantyForms);
+router.get('/',    verifyToken, authorizeRole('ADMIN'), getAllWarrantyForms);
 
-router.get('/:formId', verifyToken, authorizeRole('ADMIN'), getWarrantyFormDetail);
-
+// Controller handles role-based authorization (employee ownership + 24 h window / admin unrestricted).
+router.put('/:formId',    verifyToken, warrantyValidationRules, updateWarrantyForm);
+router.get('/:formId',    verifyToken, authorizeRole('ADMIN'), getWarrantyFormDetail);
 router.delete('/:formId', verifyToken, authorizeRole('ADMIN'), deleteWarrantyForm);
 
 module.exports = router;

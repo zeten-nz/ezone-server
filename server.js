@@ -77,6 +77,7 @@ const { initializeDatabase }         = require('./config/database');
 const authRoutes                      = require('./routes/authRoutes');
 const userRoutes                      = require('./routes/userRoutes');
 const warrantyRoutes                  = require('./routes/warrantyRoutes');
+const registrationRequestRoutes       = require('./routes/registrationRequestRoutes');
 const { exportWarrantyForms, exportByBranch, exportEmployeeData } =
   require('./controllers/excelController');
 const { verifyToken, authorizeRole }  = require('./middleware/auth');
@@ -189,12 +190,19 @@ app.get('/health', (req, res) => {
 app.use('/api/auth', authLimiter, authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/warranty', warrantyRoutes);
+app.use('/api/registration-requests', registrationRequestRoutes);
 app.get('/api/export/warranty', verifyToken, authorizeRole('ADMIN'), exportWarrantyForms);
 app.get('/api/export/branch',   verifyToken, authorizeRole('ADMIN'), exportByBranch);
 app.get('/api/export/employee', verifyToken, exportEmployeeData);
 
 // Dashboard is defined inline here (no separate controller/route file).
 // Pass errors to next(error) so the centralized errorHandler handles them.
+//
+// NOTE on additive fields (forms_last_14_days / fuel_type_breakdown /
+// top_organizations): these were added to give the dashboard real charts
+// instead of fabricated numbers. They are pure read-only aggregates over
+// existing tables — nothing existing above was renamed, removed, or
+// restructured, so no existing consumer of this endpoint breaks.
 app.get('/api/dashboard', verifyToken, authorizeRole('ADMIN'), async (req, res, next) => {
   try {
     const { pool } = require('./config/database');
@@ -217,12 +225,51 @@ app.get('/api/dashboard', verifyToken, authorizeRole('ADMIN'), async (req, res, 
        LIMIT 5`
     );
 
+    const [dailyCounts] = await connection.execute(
+      `SELECT DATE(created_at) as date, COUNT(*) as count
+       FROM warranty_forms
+       WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL 13 DAY)
+       GROUP BY DATE(created_at)`
+    );
+
+    const [fuelTypeRows] = await connection.execute(
+      `SELECT reducer_fuel_type as type, COUNT(*) as count
+       FROM warranty_forms
+       GROUP BY reducer_fuel_type`
+    );
+
+    const [topOrganizationRows] = await connection.execute(
+      `SELECT organization_name as name, COUNT(*) as count
+       FROM warranty_forms
+       GROUP BY organization_name
+       ORDER BY count DESC
+       LIMIT 5`
+    );
+
     connection.release();
+
+    // Fill in the full 14-day window with zero-count days so the frontend
+    // gets a continuous series (MySQL only returns rows that have data).
+    const countsByDate = new Map(
+      dailyCounts.map((row) => [
+        row.date instanceof Date ? row.date.toISOString().split('T')[0] : row.date,
+        row.count,
+      ])
+    );
+    const formsLast14Days = Array.from({ length: 14 }, (_, i) => {
+      const date = new Date();
+      date.setDate(date.getDate() - (13 - i));
+      const isoDate = date.toISOString().split('T')[0];
+      return { date: isoDate, count: countsByDate.get(isoDate) || 0 };
+    });
 
     res.json({
       total_employees: employeeCount[0].count,
       total_forms: formCount[0].count,
-      recent_forms: recentForms
+      recent_forms: recentForms,
+      forms_last_14_days: formsLast14Days,
+      fuel_type_breakdown: fuelTypeRows,
+      top_organizations: topOrganizationRows,
     });
   } catch (error) {
     next(error); // Forward to centralized errorHandler
