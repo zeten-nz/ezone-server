@@ -6,7 +6,10 @@ const getAllUsers = async (req, res, next) => {
   try {
     const connection = await pool.getConnection();
     const [users] = await connection.execute(
-      'SELECT id, full_name, username, phone, branch_code, role, is_active, created_at FROM users ORDER BY created_at DESC'
+      `SELECT u.id, u.full_name, u.username, u.phone, u.branch_code, u.branch_id, b.name AS branch_name,
+              u.role, u.is_active, u.created_at
+       FROM users u LEFT JOIN branches b ON u.branch_id = b.id
+       ORDER BY u.created_at DESC`
     );
     connection.release();
 
@@ -23,7 +26,7 @@ const createUser = async (req, res, next) => {
       return res.status(400).json({ success: false, message: errors.array()[0].msg, errorCode: 'VALIDATION_ERROR', timestamp: new Date().toISOString() });
     }
 
-    const { full_name, username, password, phone, branch_code } = req.body;
+    const { full_name, username, password, phone, branch_id } = req.body;
     const connection = await pool.getConnection();
 
     const [existing] = await connection.execute(
@@ -39,8 +42,8 @@ const createUser = async (req, res, next) => {
     const hashedPassword = await bcrypt.hash(password, 10);
 
     await connection.execute(
-      'INSERT INTO users (full_name, username, password, phone, branch_code, role, is_active) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      [full_name, username, hashedPassword, phone, branch_code, 'EMPLOYEE', true]
+      'INSERT INTO users (full_name, username, password, phone, branch_id, role, is_active) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [full_name, username, hashedPassword, phone, branch_id || null, 'EMPLOYEE', true]
     );
 
     connection.release();
@@ -59,13 +62,13 @@ const updateUser = async (req, res, next) => {
     }
 
     const { userId } = req.params;
-    const { full_name, phone, branch_code } = req.body;
+    const { full_name, phone, branch_id } = req.body;
 
     const connection = await pool.getConnection();
 
     await connection.execute(
-      'UPDATE users SET full_name = ?, phone = ?, branch_code = ? WHERE id = ?',
-      [full_name, phone, branch_code, userId]
+      'UPDATE users SET full_name = ?, phone = ?, branch_id = ? WHERE id = ?',
+      [full_name, phone, branch_id || null, userId]
     );
 
     connection.release();
@@ -131,7 +134,10 @@ const getUser = async (req, res, next) => {
     const connection = await pool.getConnection();
 
     const [users] = await connection.execute(
-      'SELECT id, full_name, username, phone, branch_code, role, is_active FROM users WHERE id = ?',
+      `SELECT u.id, u.full_name, u.username, u.phone, u.branch_code, u.branch_id, b.name AS branch_name,
+              u.role, u.is_active
+       FROM users u LEFT JOIN branches b ON u.branch_id = b.id
+       WHERE u.id = ?`,
       [userId]
     );
 

@@ -73,11 +73,15 @@ const compression = require('compression');
 const morgan   = require('morgan');
 const rateLimit = require('express-rate-limit');
 
-const { initializeDatabase }         = require('./config/database');
+const { initializeDatabase, pool }    = require('./config/database');
 const authRoutes                      = require('./routes/authRoutes');
 const userRoutes                      = require('./routes/userRoutes');
 const warrantyRoutes                  = require('./routes/warrantyRoutes');
 const registrationRequestRoutes       = require('./routes/registrationRequestRoutes');
+const branchRoutes                    = require('./routes/branchRoutes');
+const productRoutes                   = require('./routes/productRoutes');
+const reportsRoutes                   = require('./routes/reportsRoutes');
+const carRoutes                       = require('./routes/carRoutes');
 const { exportWarrantyForms, exportByBranch, exportEmployeeData } =
   require('./controllers/excelController');
 const { verifyToken, authorizeRole }  = require('./middleware/auth');
@@ -191,6 +195,10 @@ app.use('/api/auth', authLimiter, authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/warranty', warrantyRoutes);
 app.use('/api/registration-requests', registrationRequestRoutes);
+app.use('/api/branches', branchRoutes);
+app.use('/api/products', productRoutes);
+app.use('/api/reports', reportsRoutes);
+app.use('/api/cars', carRoutes);
 app.get('/api/export/warranty', verifyToken, authorizeRole('ADMIN'), exportWarrantyForms);
 app.get('/api/export/branch',   verifyToken, authorizeRole('ADMIN'), exportByBranch);
 app.get('/api/export/employee', verifyToken, exportEmployeeData);
@@ -217,10 +225,16 @@ app.get('/api/dashboard', verifyToken, authorizeRole('ADMIN'), async (req, res, 
       'SELECT COUNT(*) as count FROM warranty_forms'
     );
 
+    // reducer_fuel_type_resolved: a warranty has one fuel type for the whole
+    // installation (wf.fuel_type) — falls back to the REDUCER equipment
+    // row's fuel type, then the oldest legacy flat column, for historical
+    // rows that predate whichever redesign last touched fuel type.
     const [recentForms] = await connection.execute(
-      `SELECT wf.*, u.full_name as employee_name
+      `SELECT wf.*, u.full_name as employee_name,
+              COALESCE(wf.fuel_type, we.fuel_type, wf.reducer_fuel_type) AS reducer_fuel_type_resolved
        FROM warranty_forms wf
        JOIN users u ON wf.employee_id = u.id
+       LEFT JOIN warranty_equipment we ON we.warranty_form_id = wf.id AND we.equipment_type = 'REDUCER'
        ORDER BY wf.created_at DESC
        LIMIT 5`
     );
@@ -232,16 +246,21 @@ app.get('/api/dashboard', verifyToken, authorizeRole('ADMIN'), async (req, res, 
        GROUP BY DATE(created_at)`
     );
 
+    // One fuel type per warranty (wf.fuel_type) — falls back to the REDUCER
+    // equipment row, then the oldest legacy flat column, so historical rows
+    // from either prior redesign still count toward the chart.
     const [fuelTypeRows] = await connection.execute(
-      `SELECT reducer_fuel_type as type, COUNT(*) as count
-       FROM warranty_forms
-       GROUP BY reducer_fuel_type`
+      `SELECT COALESCE(wf.fuel_type, we.fuel_type, wf.reducer_fuel_type) AS type, COUNT(*) AS count
+       FROM warranty_forms wf
+       LEFT JOIN warranty_equipment we ON we.warranty_form_id = wf.id AND we.equipment_type = 'REDUCER'
+       WHERE COALESCE(wf.fuel_type, we.fuel_type, wf.reducer_fuel_type) IS NOT NULL
+       GROUP BY COALESCE(wf.fuel_type, we.fuel_type, wf.reducer_fuel_type)`
     );
 
     const [topOrganizationRows] = await connection.execute(
-      `SELECT organization_name as name, COUNT(*) as count
+      `SELECT installer_branch as name, COUNT(*) as count
        FROM warranty_forms
-       GROUP BY organization_name
+       GROUP BY installer_branch
        ORDER BY count DESC
        LIMIT 5`
     );
@@ -295,6 +314,21 @@ const startServer = async () => {
     // This ensures the server is never reachable before the schema is ready.
     const loadMockData = process.env.LOAD_MOCK_DATA !== 'false';
     await initializeDatabase(loadMockData);
+
+    // Starts the EasyGas retry sweep — the only path that pushes a warranty
+    // to EasyGas (see services/easyGasSyncSweep.js for why there's no
+    // fire-and-forget push inside createWarrantyForm/updateWarrantyForm).
+    // Safe to start even before EASYGAS_WARRANTY_API_BASE_URL/SHARED_SECRET
+    // are configured — every submission just accumulates as PENDING/retries
+    // until the real credentials arrive at go-live.
+    const { startEasyGasSyncSweep } = require('./services/easyGasSyncSweep');
+    startEasyGasSyncSweep(pool);
+
+    // Starts the EasyGas catalog sync (brands/products/cars) — same
+    // crash-safety contract, safe to start pre-go-live (every cycle just
+    // no-ops as a network-error retry until real credentials arrive).
+    const { startEasyGasCatalogSyncSweep } = require('./services/easyGasCatalogSyncSweep');
+    startEasyGasCatalogSyncSweep(pool);
 
     const server = app.listen(PORT, () => {
       console.log(

@@ -1,5 +1,7 @@
 const ExcelJS = require('exceljs');
 const { pool } = require('../config/database');
+const { attachEquipment } = require('../utils/warrantyEquipment');
+const { resolveVehicleName } = require('../utils/vehicleName');
 
 const getDateRangeFilter = (days) => {
   if (!days || days === 'all') return null;
@@ -15,42 +17,63 @@ const getDateRangeFilter = (days) => {
 const getLang = (req) => (req.query.lang === 'ru' ? 'ru' : 'uz');
 
 // Single bilingual source for every column label used across all 3 export
-// functions — replaces what used to be 3 separate hardcoded English arrays.
+// functions.
 const EXCEL_FIELD_LABELS = {
-  id:             { uz: 'ID',                 ru: 'ID' },
-  employee:       { uz: 'Xodim',              ru: 'Сотрудник' },
-  region:         { uz: 'Viloyat',            ru: 'Область' },
-  city:           { uz: 'Shahar',             ru: 'Город' },
-  district:       { uz: 'Tuman',              ru: 'Район' },
-  organization:   { uz: 'Tashkilot',          ru: 'Организация' },
-  orgPhone:       { uz: 'Telefon',            ru: 'Телефон' },
-  installer:      { uz: "O'rnatuvchi",        ru: 'Установщик' },
-  warrantyNumber: { uz: 'Kafolat №',          ru: 'Гарантия №' },
-  date:           { uz: 'Sana',               ru: 'Дата' },
-  brand:          { uz: 'Brend',              ru: 'Марка' },
-  model:          { uz: 'Model',              ru: 'Модель' },
-  year:           { uz: 'Yil',                ru: 'Год' },
-  plate:          { uz: 'Raqam',              ru: 'Номер' },
-  vin:            { uz: 'VIN',                ru: 'VIN' },
-  engineVol:      { uz: 'Dvigatel hajmi',     ru: 'Объем двиг.' },
-  power:          { uz: 'Quvvat',             ru: 'Мощность' },
-  mileage:        { uz: 'Probeg',             ru: 'Пробег' },
-  owner:          { uz: 'Egasi',              ru: 'Владелец' },
-  ownerPhone:     { uz: 'Telefon',            ru: 'Телефон' },
-  reducerType:    { uz: 'Redyuktor turi',     ru: 'Тип редуктора' },
-  reducer:        { uz: 'Redyuktor',          ru: 'Редуктор' },
-  reducerSerial:  { uz: 'Seriya',             ru: 'Серия' },
-  cylinderType:   { uz: 'Tsilindr turi',      ru: 'Тип цилиндра' },
-  cylinder:       { uz: 'Tsilindr',           ru: 'Цилиндр' },
-  cylinderSerial: { uz: 'Seriya',             ru: 'Серия' },
-  stag:           { uz: 'STAG',               ru: 'STAG' },
-  stagSerial:     { uz: 'Seriya',             ru: 'Серия' },
-  injector:       { uz: 'Injektor',           ru: 'Инжектор' },
-  injectorSerial: { uz: 'Seriya',             ru: 'Серия' },
-  branch:         { uz: 'Filial',             ru: 'Филиал' },
+  id:                { uz: 'ID',                       ru: 'ID' },
+  employee:          { uz: 'Xodim',                    ru: 'Сотрудник' },
+  region:            { uz: 'Viloyat',                  ru: 'Область' },
+  city:              { uz: 'Shahar',                   ru: 'Город' },
+  district:          { uz: 'Tuman',                    ru: 'Район' },
+  organization:      { uz: 'Tashkilot',                ru: 'Организация' },
+  orgPhone:          { uz: 'Telefon',                  ru: 'Телефон' },
+  installer:         { uz: "O'rnatuvchi",              ru: 'Установщик' },
+  warrantyNumber:    { uz: 'Kafolat №',                ru: 'Гарантия №' },
+  date:              { uz: 'Sana',                     ru: 'Дата' },
+  vehicle:           { uz: 'Avtomobil',                ru: 'Автомобиль' },
+  year:              { uz: 'Yil',                      ru: 'Год' },
+  plate:             { uz: 'Raqam',                    ru: 'Номер' },
+  vin:               { uz: 'VIN',                      ru: 'VIN' },
+  engineVol:         { uz: 'Dvigatel hajmi',           ru: 'Объем двиг.' },
+  power:             { uz: 'Quvvat',                   ru: 'Мощность' },
+  mileage:           { uz: 'Probeg',                   ru: 'Пробег' },
+  owner:             { uz: 'Egasi',                    ru: 'Владелец' },
+  ownerPhone:        { uz: 'Telefon',                  ru: 'Телефон' },
+  installedProducts: { uz: "O'rnatilgan jihozlar",     ru: 'Установленное оборудование' },
+  branch:            { uz: 'Filial',                   ru: 'Филиал' },
+};
+
+const EQUIPMENT_TYPE_LABELS = {
+  REDUCER:       { uz: 'Redyuktor',       ru: 'Редуктор' },
+  CYLINDER:      { uz: 'Tsilindr',        ru: 'Цилиндр' },
+  CONTROLLER:    { uz: 'Kontroller',      ru: 'Контроллер' },
+  INJECTOR_RAIL: { uz: 'Injektor relsi',  ru: 'Инжекторная рейка' },
 };
 
 const buildHeaders = (keys, lang) => keys.map((key) => EXCEL_FIELD_LABELS[key][lang]);
+
+/**
+ * One column summarizing every equipment row — falls back to the original 4
+ * legacy free-text fields for historical rows recorded before either the
+ * product-catalog or equipment-normalization redesigns existed (see
+ * utils/warrantyEquipment.js).
+ */
+const formatEquipmentSummary = (form, lang) => {
+  if (form.equipment && form.equipment.length > 0) {
+    return form.equipment
+      .map((e) => {
+        const label = EQUIPMENT_TYPE_LABELS[e.equipment_type]?.[lang] || e.equipment_type;
+        return `${label}: ${e.product_name}${e.serial_number ? ` (${e.serial_number})` : ''}`;
+      })
+      .join('; ');
+  }
+
+  const parts = [];
+  if (form.reducer_manufacturer) parts.push(`${lang === 'ru' ? 'Редуктор' : 'Redyuktor'}: ${form.reducer_manufacturer} (${form.reducer_serial_number})`);
+  if (form.cylinder_manufacturer) parts.push(`${lang === 'ru' ? 'Цилиндр' : 'Tsilindr'}: ${form.cylinder_manufacturer} (${form.cylinder_serial_number})`);
+  if (form.stag_controller_manufacturer) parts.push(`STAG: ${form.stag_controller_manufacturer} (${form.stag_controller_serial_number})`);
+  if (form.injector_rail_manufacturer) parts.push(`${lang === 'ru' ? 'Инжектор' : 'Injektor'}: ${form.injector_rail_manufacturer} (${form.injector_rail_serial_number})`);
+  return parts.join('; ') || '—';
+};
 
 const exportWarrantyForms = async (req, res, next) => {
   try {
@@ -73,7 +96,8 @@ const exportWarrantyForms = async (req, res, next) => {
 
     query += ` ORDER BY wf.created_at DESC`;
 
-    const [forms] = await connection.execute(query, params);
+    const [rawForms] = await connection.execute(query, params);
+    const forms = await attachEquipment(connection, rawForms);
     connection.release();
 
     const workbook = new ExcelJS.Workbook();
@@ -81,10 +105,9 @@ const exportWarrantyForms = async (req, res, next) => {
 
     const columnKeys = [
       'id', 'employee', 'region', 'city', 'district', 'organization', 'orgPhone',
-      'installer', 'warrantyNumber', 'date', 'brand', 'model', 'year',
+      'installer', 'warrantyNumber', 'date', 'vehicle', 'year',
       'plate', 'vin', 'engineVol', 'power', 'mileage', 'owner', 'ownerPhone',
-      'reducerType', 'reducer', 'reducerSerial', 'cylinderType', 'cylinder',
-      'cylinderSerial', 'stag', 'stagSerial', 'injector', 'injectorSerial', 'branch',
+      'installedProducts', 'branch',
     ];
 
     const headerRow = worksheet.addRow(buildHeaders(columnKeys, lang));
@@ -93,7 +116,7 @@ const exportWarrantyForms = async (req, res, next) => {
     headerRow.alignment = { horizontal: 'center', vertical: 'center', wrapText: true };
 
     // Set column widths
-    const columnWidths = [8, 14, 10, 10, 10, 14, 10, 12, 12, 12, 12, 12, 8, 11, 11, 11, 10, 10, 12, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 12];
+    const columnWidths = [8, 14, 10, 10, 10, 14, 10, 12, 12, 12, 20, 8, 11, 11, 11, 10, 10, 12, 10, 40, 12];
     worksheet.columns = columnWidths.map(width => ({ width }));
 
     const dateLocale = lang === 'ru' ? 'ru-RU' : 'uz-UZ';
@@ -101,17 +124,13 @@ const exportWarrantyForms = async (req, res, next) => {
     // Add data rows
     forms.forEach((form, idx) => {
       const row = worksheet.addRow([
-        form.id, form.employee_name, form.region, form.city, form.district,
-        form.organization_name, form.organization_phone, form.installer_full_name,
+        form.id, form.employee_name, form.installer_region, form.city, form.installer_district,
+        form.installer_branch, form.organization_phone, form.installer_full_name,
         form.warranty_book_number, new Date(form.installation_date).toLocaleDateString(dateLocale),
-        form.vehicle_brand, form.vehicle_model, form.vehicle_production_year,
+        resolveVehicleName(form), form.vehicle_production_year,
         form.vehicle_plate_number, form.vehicle_vin, form.vehicle_engine_volume,
         form.vehicle_engine_power, form.vehicle_mileage, form.owner_full_name,
-        form.owner_phone, form.reducer_fuel_type, form.reducer_manufacturer,
-        form.reducer_serial_number, form.cylinder_fuel_type, form.cylinder_manufacturer,
-        form.cylinder_serial_number, form.stag_controller_manufacturer,
-        form.stag_controller_serial_number, form.injector_rail_manufacturer,
-        form.injector_rail_serial_number, form.branch_code
+        form.owner_phone, formatEquipmentSummary(form, lang), form.branch_code
       ]);
 
       row.font = { size: 9 };
@@ -164,7 +183,8 @@ const exportByBranch = async (req, res, next) => {
 
     query += ` ORDER BY wf.created_at DESC`;
 
-    const [forms] = await connection.execute(query, params);
+    const [rawForms] = await connection.execute(query, params);
+    const forms = await attachEquipment(connection, rawForms);
     connection.release();
 
     const workbook = new ExcelJS.Workbook();
@@ -177,17 +197,16 @@ const exportByBranch = async (req, res, next) => {
 
     const columnKeys = [
       'id', 'employee', 'region', 'city', 'district', 'organization', 'orgPhone',
-      'installer', 'warrantyNumber', 'date', 'brand', 'model', 'year',
+      'installer', 'warrantyNumber', 'date', 'vehicle', 'year',
       'plate', 'vin', 'engineVol', 'power', 'mileage', 'owner', 'ownerPhone',
-      'reducerType', 'reducer', 'reducerSerial', 'cylinderType', 'cylinder',
-      'cylinderSerial', 'stag', 'stagSerial', 'injector', 'injectorSerial',
+      'installedProducts',
     ];
 
     const headerRow = worksheet.addRow(buildHeaders(columnKeys, lang));
     headerRow.font = { bold: true, color: { argb: 'FFFFFFFF' }, size: 10 };
     headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1e3a8a' } };
 
-    const columnWidths = [8, 14, 10, 10, 10, 14, 10, 12, 12, 12, 12, 12, 8, 11, 11, 11, 10, 10, 12, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10];
+    const columnWidths = [8, 14, 10, 10, 10, 14, 10, 12, 12, 12, 20, 8, 11, 11, 11, 10, 10, 12, 10, 40];
     worksheet.columns = columnWidths.map(width => ({ width }));
 
     const dateLocale = lang === 'ru' ? 'ru-RU' : 'uz-UZ';
@@ -195,17 +214,13 @@ const exportByBranch = async (req, res, next) => {
     // Add data rows
     forms.forEach((form, idx) => {
       const row = worksheet.addRow([
-        form.id, form.employee_name, form.region, form.city, form.district,
-        form.organization_name, form.organization_phone, form.installer_full_name,
+        form.id, form.employee_name, form.installer_region, form.city, form.installer_district,
+        form.installer_branch, form.organization_phone, form.installer_full_name,
         form.warranty_book_number, new Date(form.installation_date).toLocaleDateString(dateLocale),
-        form.vehicle_brand, form.vehicle_model, form.vehicle_production_year,
+        resolveVehicleName(form), form.vehicle_production_year,
         form.vehicle_plate_number, form.vehicle_vin, form.vehicle_engine_volume,
         form.vehicle_engine_power, form.vehicle_mileage, form.owner_full_name,
-        form.owner_phone, form.reducer_fuel_type, form.reducer_manufacturer,
-        form.reducer_serial_number, form.cylinder_fuel_type, form.cylinder_manufacturer,
-        form.cylinder_serial_number, form.stag_controller_manufacturer,
-        form.stag_controller_serial_number, form.injector_rail_manufacturer,
-        form.injector_rail_serial_number
+        form.owner_phone, formatEquipmentSummary(form, lang)
       ]);
 
       row.font = { size: 9 };
@@ -268,7 +283,8 @@ const exportEmployeeData = async (req, res, next) => {
 
     query += ` ORDER BY wf.created_at DESC`;
 
-    const [forms] = await connection.execute(query, params);
+    const [rawForms] = await connection.execute(query, params);
+    const forms = await attachEquipment(connection, rawForms);
     connection.release();
 
     const workbook = new ExcelJS.Workbook();
@@ -281,17 +297,16 @@ const exportEmployeeData = async (req, res, next) => {
 
     const columnKeys = [
       'id', 'region', 'city', 'district', 'organization', 'orgPhone',
-      'installer', 'warrantyNumber', 'date', 'brand', 'model', 'year',
+      'installer', 'warrantyNumber', 'date', 'vehicle', 'year',
       'plate', 'vin', 'engineVol', 'power', 'mileage', 'owner', 'ownerPhone',
-      'reducerType', 'reducer', 'reducerSerial', 'cylinderType', 'cylinder',
-      'cylinderSerial', 'stag', 'stagSerial', 'injector', 'injectorSerial',
+      'installedProducts',
     ];
 
     const headerRow = worksheet.addRow(buildHeaders(columnKeys, lang));
     headerRow.font = { bold: true, color: { argb: 'FFFFFFFF' }, size: 10 };
     headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1e3a8a' } };
 
-    const columnWidths = [8, 10, 10, 10, 14, 10, 12, 12, 12, 12, 12, 8, 11, 11, 11, 10, 10, 12, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10];
+    const columnWidths = [8, 10, 10, 10, 14, 10, 12, 12, 12, 20, 8, 11, 11, 11, 10, 10, 12, 10, 40];
     worksheet.columns = columnWidths.map(width => ({ width }));
 
     const dateLocale = lang === 'ru' ? 'ru-RU' : 'uz-UZ';
@@ -299,17 +314,13 @@ const exportEmployeeData = async (req, res, next) => {
     // Add data rows
     forms.forEach((form, idx) => {
       const row = worksheet.addRow([
-        form.id, form.region, form.city, form.district,
-        form.organization_name, form.organization_phone, form.installer_full_name,
+        form.id, form.installer_region, form.city, form.installer_district,
+        form.installer_branch, form.organization_phone, form.installer_full_name,
         form.warranty_book_number, new Date(form.installation_date).toLocaleDateString(dateLocale),
-        form.vehicle_brand, form.vehicle_model, form.vehicle_production_year,
+        resolveVehicleName(form), form.vehicle_production_year,
         form.vehicle_plate_number, form.vehicle_vin, form.vehicle_engine_volume,
         form.vehicle_engine_power, form.vehicle_mileage, form.owner_full_name,
-        form.owner_phone, form.reducer_fuel_type, form.reducer_manufacturer,
-        form.reducer_serial_number, form.cylinder_fuel_type, form.cylinder_manufacturer,
-        form.cylinder_serial_number, form.stag_controller_manufacturer,
-        form.stag_controller_serial_number, form.injector_rail_manufacturer,
-        form.injector_rail_serial_number
+        form.owner_phone, formatEquipmentSummary(form, lang)
       ]);
 
       row.font = { size: 9 };

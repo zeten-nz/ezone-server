@@ -22,7 +22,7 @@ router.post('/', [
   body('username').isLength({ min: 3 }).withMessage('Username must be at least 3 characters'),
   body('password').isLength({ min: 6 }).withMessage('Password must be at least 6 characters'),
   body('phone').optional({ checkFalsy: true }),
-  body('branch_code').optional({ checkFalsy: true })
+  body('branch_id').optional({ checkFalsy: true }).isInt().withMessage('Invalid branch')
 ], createUser);
 
 router.get('/:userId', getUser);
@@ -30,7 +30,7 @@ router.get('/:userId', getUser);
 router.put('/:userId', [
   body('full_name').notEmpty().withMessage('Full name is required'),
   body('phone').optional({ checkFalsy: true }),
-  body('branch_code').optional({ checkFalsy: true })
+  body('branch_id').optional({ checkFalsy: true }).isInt().withMessage('Invalid branch')
 ], updateUser);
 
 router.patch('/:userId/disable', disableUser);

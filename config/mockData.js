@@ -14,47 +14,56 @@ const mockEmployees = [
 ];
 
 const carBrands = ['Chevrolet', 'Toyota', 'Hyundai', 'Kia', 'Volkswagen', 'BMW', 'Mercedes', 'Ford'];
+const carModels = ['Cobalt', 'Nexia', 'Camry', 'Sportage', 'Malibu', 'Gentra', 'Spark', 'Tracker'];
 const cities = ['Tashkent', 'Samarkand', 'Bukhara', 'Fergana', 'Andijan', 'Namangan'];
-const manufacturers = ['STAG', 'BRC', 'Impco', 'Tomasetto', 'Landi Renzo'];
 
-const generateMockWarrantyForm = (employeeId, index) => {
+// Seed catalog — a small realistic set per fixed equipment slot, so
+// generated mock warranties have real products to reference (matching the
+// "no free-text equipment" rule the real form now enforces).
+const mockCatalog = [
+  { category: 'REDUCER', brand: 'STAG', model: 'R02' },
+  { category: 'REDUCER', brand: 'BRC', model: 'SQ32' },
+  { category: 'CYLINDER', brand: 'STAKO', model: 'Cyl-50L' },
+  { category: 'CYLINDER', brand: 'Vitkovice', model: 'Cyl-60L' },
+  { category: 'CONTROLLER', brand: 'STAG', model: 'QMAX BASIC' },
+  { category: 'CONTROLLER', brand: 'STAG', model: 'QMAX PLUS' },
+  { category: 'INJECTOR_RAIL', brand: 'Valtek', model: 'Rail-4' },
+  { category: 'INJECTOR_RAIL', brand: 'Hana', model: 'Rail-6' },
+];
+
+const EQUIPMENT_TYPES = ['REDUCER', 'CYLINDER', 'CONTROLLER', 'INJECTOR_RAIL'];
+
+const generateMockWarrantyForm = (employeeId, employee, index) => {
   const today = new Date();
   const formDate = new Date(today.getTime() - Math.random() * 90 * 24 * 60 * 60 * 1000);
 
   const brand = carBrands[Math.floor(Math.random() * carBrands.length)];
+  const model = carModels[Math.floor(Math.random() * carModels.length)];
   const city = cities[Math.floor(Math.random() * cities.length)];
   const plateNumber = `01A${Math.floor(Math.random() * 900) + 100}${Math.floor(Math.random() * 9)}`;
 
   return {
     employee_id: employeeId,
-    region: 'Tashkent',
-    city: city,
-    district: 'Urban',
-    organization_name: `Garaz ${index}`,
+    installer_region: 'Tashkent',
+    city,
+    installer_district: 'Urban',
+    installer_branch: `Garaz ${employee.branch_code}`,
     organization_phone: '+998901234567',
-    installer_full_name: mockEmployees.find(e => e.full_name)?.full_name || 'Installer',
+    installer_full_name: employee.full_name,
+    installer_phone: employee.phone,
+    installer_branch_code: employee.branch_code,
     warranty_book_number: `GB${employeeId}${Math.random().toString(36).substring(2, 10).toUpperCase()}`,
     installation_date: formDate.toISOString().split('T')[0],
-    vehicle_brand: brand,
-    vehicle_model: ['Model A', 'Model B', 'Model S', 'Model X'][Math.floor(Math.random() * 4)],
+    // One fuel type for the whole installation, not per equipment row.
+    fuel_type: Math.random() < 0.5 ? 'LPG' : 'CNG',
+    vehicle_name: `${brand} ${model}`,
     vehicle_production_year: 2015 + Math.floor(Math.random() * 9),
-    vehicle_plate_number: plateNumber,
+    // Every 5th record has no plate yet — exercises the now-optional field.
+    vehicle_plate_number: index % 5 === 0 ? null : plateNumber,
     vehicle_vin: `VIN${employeeId}${Math.random().toString(36).substring(2, 15).toUpperCase()}`,
-    vehicle_engine_volume: `${1.2 + Math.floor(Math.random() * 20) / 10}L`,
-    vehicle_engine_power: `${90 + Math.floor(Math.random() * 100)}hp`,
     vehicle_mileage: Math.floor(Math.random() * 150000),
     owner_full_name: `Owner ${index}`,
     owner_phone: `+99890${Math.floor(Math.random() * 9000000) + 1000000}`,
-    reducer_fuel_type: 'LPG',
-    reducer_manufacturer: manufacturers[Math.floor(Math.random() * manufacturers.length)],
-    reducer_serial_number: `R${Math.random().toString(36).substring(2, 10).toUpperCase()}`,
-    cylinder_fuel_type: 'LPG',
-    cylinder_manufacturer: manufacturers[Math.floor(Math.random() * manufacturers.length)],
-    cylinder_serial_number: `C${Math.random().toString(36).substring(2, 10).toUpperCase()}`,
-    stag_controller_manufacturer: 'STAG',
-    stag_controller_serial_number: `S${Math.random().toString(36).substring(2, 10).toUpperCase()}`,
-    injector_rail_manufacturer: manufacturers[Math.floor(Math.random() * manufacturers.length)],
-    injector_rail_serial_number: `I${Math.random().toString(36).substring(2, 10).toUpperCase()}`,
   };
 };
 
@@ -68,6 +77,23 @@ const generateMockData = async (connection) => {
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
       ['System Administrator', 'admin', adminPassword, '+998901234567', 'ADMIN', 'ADMIN', true]
     );
+
+    // Seed the product catalog once, capturing each row's id/brand/model so
+    // mock warranty_equipment rows can reference real catalog entries.
+    const catalogByCategory = new Map();
+    for (const product of mockCatalog) {
+      const [result] = await connection.execute(
+        'INSERT INTO products (category, brand, model) VALUES (?, ?, ?)',
+        [product.category, product.brand, product.model]
+      );
+      const entry = { id: result.insertId, brand: product.brand, model: product.model };
+      if (!catalogByCategory.has(product.category)) catalogByCategory.set(product.category, []);
+      catalogByCategory.get(product.category).push(entry);
+    }
+    const pickProduct = (category) => {
+      const options = catalogByCategory.get(category);
+      return options[Math.floor(Math.random() * options.length)];
+    };
 
     // Create employees with mock data
     const warranties = [];
@@ -87,43 +113,51 @@ const generateMockData = async (connection) => {
       // Generate 10-20 warranty forms for each employee
       const formCount = 10 + Math.floor(Math.random() * 11);
       for (let j = 0; j < formCount; j++) {
-        warranties.push({ ...generateMockWarrantyForm(employeeId, j + 1), employee_id: employeeId });
+        warranties.push(generateMockWarrantyForm(employeeId, emp, j + 1));
       }
     }
 
-    // Insert all warranties
+    // Insert all warranties, each with its 4 fixed equipment rows.
     for (const warranty of warranties) {
-      await connection.execute(
+      const [result] = await connection.execute(
         `INSERT INTO warranty_forms (
-          employee_id, region, city, district, organization_name, organization_phone,
-          installer_full_name, warranty_book_number, installation_date,
-          vehicle_brand, vehicle_model, vehicle_production_year, vehicle_plate_number,
-          vehicle_vin, vehicle_engine_volume, vehicle_engine_power, vehicle_mileage,
-          owner_full_name, owner_phone,
-          reducer_fuel_type, reducer_manufacturer, reducer_serial_number,
-          cylinder_fuel_type, cylinder_manufacturer, cylinder_serial_number,
-          stag_controller_manufacturer, stag_controller_serial_number,
-          injector_rail_manufacturer, injector_rail_serial_number
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          employee_id, installer_region, city, installer_district, installer_branch, organization_phone,
+          installer_full_name, installer_phone, installer_branch_code,
+          warranty_book_number, installation_date, fuel_type,
+          vehicle_name, vehicle_production_year, vehicle_plate_number,
+          vehicle_vin, vehicle_mileage,
+          owner_full_name, owner_phone
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
-          warranty.employee_id, warranty.region, warranty.city, warranty.district,
-          warranty.organization_name, warranty.organization_phone, warranty.installer_full_name,
-          warranty.warranty_book_number, warranty.installation_date, warranty.vehicle_brand,
-          warranty.vehicle_model, warranty.vehicle_production_year, warranty.vehicle_plate_number,
-          warranty.vehicle_vin, warranty.vehicle_engine_volume, warranty.vehicle_engine_power,
-          warranty.vehicle_mileage, warranty.owner_full_name, warranty.owner_phone,
-          warranty.reducer_fuel_type, warranty.reducer_manufacturer, warranty.reducer_serial_number,
-          warranty.cylinder_fuel_type, warranty.cylinder_manufacturer, warranty.cylinder_serial_number,
-          warranty.stag_controller_manufacturer, warranty.stag_controller_serial_number,
-          warranty.injector_rail_manufacturer, warranty.injector_rail_serial_number
+          warranty.employee_id, warranty.installer_region, warranty.city, warranty.installer_district,
+          warranty.installer_branch, warranty.organization_phone,
+          warranty.installer_full_name, warranty.installer_phone, warranty.installer_branch_code,
+          warranty.warranty_book_number, warranty.installation_date, warranty.fuel_type,
+          warranty.vehicle_name, warranty.vehicle_production_year, warranty.vehicle_plate_number,
+          warranty.vehicle_vin, warranty.vehicle_mileage,
+          warranty.owner_full_name, warranty.owner_phone,
         ]
       );
+
+      const warrantyFormId = result.insertId;
+      for (const equipmentType of EQUIPMENT_TYPES) {
+        const product = pickProduct(equipmentType);
+        await connection.execute(
+          `INSERT INTO warranty_equipment (warranty_form_id, equipment_type, product_id, product_name, serial_number)
+           VALUES (?, ?, ?, ?, ?)`,
+          [
+            warrantyFormId, equipmentType, product.id, `${product.brand} ${product.model}`,
+            `${equipmentType[0]}${Math.random().toString(36).substring(2, 10).toUpperCase()}`,
+          ]
+        );
+      }
     }
 
     console.log('Mock data created successfully!');
     console.log(`- 1 Admin user`);
     console.log(`- 10 Employee users`);
-    console.log(`- ${warranties.length} Warranty forms`);
+    console.log(`- ${mockCatalog.length} Catalog products`);
+    console.log(`- ${warranties.length} Warranty forms (each with 4 equipment rows)`);
 
     return true;
   } catch (error) {

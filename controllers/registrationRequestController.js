@@ -9,10 +9,12 @@ const getAllRegistrationRequests = async (req, res, next) => {
 
     const [requests] = await connection.execute(
       `SELECT rr.id, rr.first_name, rr.last_name, rr.region, rr.district, rr.branch_code,
+              rr.branch_id, b.name AS branch_name,
               rr.phone, rr.username, rr.status, rr.notes, rr.created_at, rr.reviewed_at,
               rr.reviewed_by, ru.full_name AS reviewer_name
        FROM registration_requests rr
        LEFT JOIN users ru ON rr.reviewed_by = ru.id
+       LEFT JOIN branches b ON rr.branch_id = b.id
        ORDER BY rr.created_at DESC`
     );
 
@@ -30,10 +32,12 @@ const getRegistrationRequestDetail = async (req, res, next) => {
 
     const [requests] = await connection.execute(
       `SELECT rr.id, rr.first_name, rr.last_name, rr.region, rr.district, rr.branch_code,
+              rr.branch_id, b.name AS branch_name,
               rr.phone, rr.username, rr.status, rr.notes, rr.created_at, rr.reviewed_at,
               rr.reviewed_by, ru.full_name AS reviewer_name
        FROM registration_requests rr
        LEFT JOIN users ru ON rr.reviewed_by = ru.id
+       LEFT JOIN branches b ON rr.branch_id = b.id
        WHERE rr.id = ?`,
       [id]
     );
@@ -133,11 +137,11 @@ const approveRegistrationRequest = async (req, res, next) => {
 
     await connection.execute(
       `INSERT INTO users
-        (full_name, first_name, last_name, username, password, phone, region, district, branch_code, photo_filename, role, is_active)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        (full_name, first_name, last_name, username, password, phone, region, district, branch_id, branch_code, photo_filename, role, is_active)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         fullName, request.first_name, request.last_name, request.username, request.password_hash,
-        request.phone, request.region, request.district, request.branch_code, request.photo_filename,
+        request.phone, request.region, request.district, request.branch_id, request.branch_code, request.photo_filename,
         'EMPLOYEE', true,
       ]
     );

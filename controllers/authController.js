@@ -28,8 +28,15 @@ const register = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'File is not a valid image', errorCode: 'INVALID_FILE_TYPE', timestamp: new Date().toISOString() });
     }
 
-    const { first_name, last_name, region, district, branch_code, phone, username, password } = req.body;
+    const { first_name, last_name, region, district, branch_id, phone, username, password } = req.body;
     const connection = await pool.getConnection();
+
+    const [branches] = await connection.execute('SELECT code FROM branches WHERE id = ? AND is_active = TRUE', [branch_id]);
+    if (branches.length === 0) {
+      connection.release();
+      fs.unlink(req.file.path, () => {});
+      return res.status(400).json({ success: false, message: 'Invalid branch', errorCode: 'VALIDATION_ERROR', timestamp: new Date().toISOString() });
+    }
 
     const [existingUsers] = await connection.execute(
       'SELECT id FROM users WHERE username = ?',
@@ -56,12 +63,15 @@ const register = async (req, res, next) => {
 
     const hashedPassword = await bcrypt.hash(password, 10);
 
+    // branch_code is kept alongside branch_id as an immutable audit snapshot
+    // of which branch this was submitted under — the branches table remains
+    // the source of truth for name/phone/location, editable independently.
     await connection.execute(
       `INSERT INTO registration_requests
-        (first_name, last_name, region, district, branch_code, phone, username, password_hash, photo_filename, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')`,
+        (first_name, last_name, region, district, branch_id, branch_code, phone, username, password_hash, photo_filename, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')`,
       [
-        first_name.trim(), last_name.trim(), region, district, branch_code,
+        first_name.trim(), last_name.trim(), region, district, branch_id, branches[0].code,
         phone.trim(), username.trim(), hashedPassword, req.file.filename,
       ]
     );
@@ -218,10 +228,16 @@ const getProfile = async (req, res, next) => {
     const userId = req.user.id;
     const connection = await pool.getConnection();
 
+    // Branch region/city/district/phone (not just name) are included because
+    // the warranty form's read-only summary shows exactly what will be
+    // snapshotted onto a submission — see warrantyController.getEmployeeSnapshot.
     const [users] = await connection.execute(
-      `SELECT id, full_name, first_name, last_name, username, phone, region, district,
-              branch_code, photo_filename, role, is_active, last_login_at, created_at
-       FROM users WHERE id = ?`,
+      `SELECT u.id, u.full_name, u.first_name, u.last_name, u.username, u.phone, u.region, u.district,
+              u.branch_code, u.branch_id, b.name AS branch_name, b.phone AS branch_phone,
+              b.region AS branch_region, b.city AS branch_city, b.district AS branch_district,
+              u.photo_filename, u.role, u.is_active, u.last_login_at, u.created_at
+       FROM users u LEFT JOIN branches b ON u.branch_id = b.id
+       WHERE u.id = ?`,
       [userId]
     );
 

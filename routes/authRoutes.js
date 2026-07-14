@@ -17,7 +17,7 @@ router.post('/register', handleRegistrationPhotoUpload, [
   body('last_name').trim().notEmpty().withMessage('Last name is required'),
   body('region').trim().notEmpty().withMessage('Region is required'),
   body('district').trim().notEmpty().withMessage('District is required'),
-  body('branch_code').trim().notEmpty().withMessage('Branch code is required'),
+  body('branch_id').notEmpty().withMessage('Branch is required').isInt().withMessage('Invalid branch'),
   body('phone').matches(PHONE_REGEX).withMessage('A valid Uzbekistan phone number is required'),
   body('username').trim().isLength({ min: 3 }).withMessage('Username must be at least 3 characters'),
   body('password').isLength({ min: 6 }).withMessage('Password must be at least 6 characters'),
