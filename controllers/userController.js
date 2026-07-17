@@ -7,7 +7,7 @@ const getAllUsers = async (req, res, next) => {
     const connection = await pool.getConnection();
     const [users] = await connection.execute(
       `SELECT u.id, u.full_name, u.username, u.phone, u.branch_code, u.branch_id, b.name AS branch_name,
-              u.role, u.is_active, u.created_at
+              u.role, u.is_super_admin, u.is_active, u.created_at
        FROM users u LEFT JOIN branches b ON u.branch_id = b.id
        ORDER BY u.created_at DESC`
     );
@@ -103,6 +103,34 @@ const setUserActive = (isActive) => async (req, res, next) => {
 const disableUser = setUserActive(false);
 const enableUser = setUserActive(true);
 
+// Grants/revokes the Super Admin capability flag — restricted to Super
+// Admins themselves (route-level requireSuperAdmin), and only meaningful on
+// an ADMIN account (an EMPLOYEE gaining this flag would have no routes that
+// check it, but the WHERE clause keeps the invariant explicit regardless).
+const setSuperAdmin = async (req, res, next) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, message: errors.array()[0].msg, errorCode: 'VALIDATION_ERROR', timestamp: new Date().toISOString() });
+    }
+
+    const { userId } = req.params;
+    const { isSuperAdmin } = req.body;
+    const connection = await pool.getConnection();
+
+    await connection.execute(
+      'UPDATE users SET is_super_admin = ? WHERE id = ? AND role = ?',
+      [!!isSuperAdmin, userId, 'ADMIN']
+    );
+
+    connection.release();
+
+    res.json({ message: isSuperAdmin ? 'Super Admin granted' : 'Super Admin revoked' });
+  } catch (error) {
+    next(error);
+  }
+};
+
 const resetPassword = async (req, res, next) => {
   try {
     const { userId } = req.params;
@@ -135,7 +163,7 @@ const getUser = async (req, res, next) => {
 
     const [users] = await connection.execute(
       `SELECT u.id, u.full_name, u.username, u.phone, u.branch_code, u.branch_id, b.name AS branch_name,
-              u.role, u.is_active
+              u.role, u.is_super_admin, u.is_active
        FROM users u LEFT JOIN branches b ON u.branch_id = b.id
        WHERE u.id = ?`,
       [userId]
@@ -159,6 +187,7 @@ module.exports = {
   updateUser,
   disableUser,
   enableUser,
+  setSuperAdmin,
   resetPassword,
   getUser
 };

@@ -92,13 +92,38 @@ const findOwnershipInfo = async (connection, formId) => {
   return rows[0] || null;
 };
 
-const findAllPaginated = async (connection, { limit, offset, search }) => {
-  let whereClause = '';
+/**
+ * Acquires a row lock on this warranty for the duration of the caller's
+ * transaction, serializing concurrent update/delete operations on the SAME
+ * warranty (a different problem from the atomic inventory-item claim in
+ * inventoryRepository — this guards the warranty row itself, not a barcode).
+ * Must be called AFTER connection.beginTransaction() to actually hold the
+ * lock; returns null (not a thrown error — that's the service layer's job,
+ * matching this file's existing convention) if the warranty no longer
+ * exists, which can happen if a concurrent request deleted it between the
+ * caller's earlier pre-transaction ownership check and this lock attempt.
+ */
+const lockForm = async (connection, formId) => {
+  const [rows] = await connection.execute('SELECT id FROM warranty_forms WHERE id = ? FOR UPDATE', [formId]);
+  return rows[0] || null;
+};
+
+// `employeeId` scopes the admin list to one installer's warranties (e.g. an
+// "open installer" drill-down from statistics) — optional, combined with
+// `search`/pagination exactly like every other admin list filter, not a
+// separate endpoint or table.
+const findAllPaginated = async (connection, { limit, offset, search, employeeId }) => {
+  const conditions = [];
   const filterParams = [];
+  if (employeeId) {
+    conditions.push('wf.employee_id = ?');
+    filterParams.push(employeeId);
+  }
   if (search) {
-    whereClause = 'WHERE (wf.vehicle_plate_number LIKE ? OR wf.owner_full_name LIKE ? OR u.full_name LIKE ?)';
+    conditions.push('(wf.vehicle_plate_number LIKE ? OR wf.owner_full_name LIKE ? OR u.full_name LIKE ?)');
     filterParams.push(`%${search}%`, `%${search}%`, `%${search}%`);
   }
+  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
   const [countRows] = await connection.execute(
     `SELECT COUNT(*) AS total FROM warranty_forms wf JOIN users u ON wf.employee_id = u.id ${whereClause}`,
     filterParams
@@ -138,6 +163,27 @@ const findDetailById = async (connection, formId) => {
     [formId]
   );
   return rows[0] || null;
+};
+
+/**
+ * For the customer-facing warranty-lookup endpoint (controllers/
+ * publicCustomerController.js) — the caller has already authenticated the
+ * customer on their own platform and sends us only a phone number; we
+ * search exactly by owner_phone, never by employee_id or any staff
+ * identity. No `users` join (unlike findDetailById/findAllPaginated):
+ * this caller has no use for — and shouldn't see — the installer's login
+ * username, only the installer_* snapshot columns already on this table.
+ */
+const findByOwnerPhone = async (connection, ownerPhone) => {
+  const [rows] = await connection.execute(
+    `SELECT wf.*, ${FUEL_TYPE_SELECT}
+     FROM warranty_forms wf
+     ${FUEL_TYPE_JOIN}
+     WHERE wf.owner_phone = ?
+     ORDER BY wf.created_at DESC`,
+    [ownerPhone]
+  );
+  return rows;
 };
 
 const searchForms = async (connection, { search, filterType }) => {
@@ -196,15 +242,45 @@ const deleteById = async (connection, formId) => {
   await connection.execute('DELETE FROM warranty_forms WHERE id = ?', [formId]);
 };
 
+/**
+ * Keyset-paginated chunk for CSV export (Phase 4) — deliberately NOT the
+ * same OFFSET-based pattern as findAllPaginated (used for ordinary UI
+ * pagination). OFFSET shifts under concurrent writes (rows inserted mid-
+ * export skip/duplicate across chunk boundaries); `WHERE id > ?` doesn't,
+ * since new rows always get a higher id and never appear before the cursor
+ * (see the Phase 4 plan's D6). Ordered by id, not created_at, for the same
+ * reason — a stable, monotonic cursor.
+ */
+const findChunkForExport = async (connection, { lastId, limit, employeeId }) => {
+  const params = [lastId];
+  let employeeClause = '';
+  if (employeeId) {
+    employeeClause = 'AND wf.employee_id = ?';
+    params.push(employeeId);
+  }
+  const [rows] = await connection.execute(
+    `SELECT wf.*, u.full_name AS employee_name, u.username AS employee_username, ${FUEL_TYPE_SELECT}
+     FROM warranty_forms wf JOIN users u ON wf.employee_id = u.id
+     ${FUEL_TYPE_JOIN}
+     WHERE wf.id > ? ${employeeClause}
+     ORDER BY wf.id ASC LIMIT ${Number(limit)}`,
+    params
+  );
+  return rows;
+};
+
 module.exports = {
   getEmployeeSnapshot,
   insert,
   update,
   findOwnershipInfo,
+  lockForm,
   findAllPaginated,
   findMinePaginated,
+  findByOwnerPhone,
   findDetailById,
   searchForms,
   resetSyncStatus,
   deleteById,
+  findChunkForExport,
 };

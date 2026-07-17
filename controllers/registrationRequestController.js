@@ -96,7 +96,19 @@ const streamRegistrationPhoto = async (req, res, next) => {
 
     res.setHeader('Content-Type', contentType);
     res.setHeader('Cache-Control', 'private, no-store');
-    fs.createReadStream(filePath).pipe(res);
+
+    // .pipe() does not forward source-stream errors to the response — an
+    // unhandled 'error' event here throws and crashes the whole process
+    // (see the identical fix in authController.js's streamProfilePhoto).
+    const stream = fs.createReadStream(filePath);
+    stream.on('error', () => {
+      if (!res.headersSent) {
+        res.status(404).json({ success: false, message: 'Photo not found', errorCode: 'NOT_FOUND', timestamp: new Date().toISOString() });
+      } else {
+        res.end();
+      }
+    });
+    stream.pipe(res);
   } catch (error) {
     next(error);
   }
@@ -146,10 +158,22 @@ const approveRegistrationRequest = async (req, res, next) => {
       ]
     );
 
-    await connection.execute(
-      'UPDATE registration_requests SET status = ?, reviewed_at = NOW(), reviewed_by = ? WHERE id = ?',
-      ['APPROVED', req.user.id, id]
+    // Guarded on status = 'PENDING', not a bare `WHERE id = ?` — the earlier
+    // check (line ~122) only rules out the common case; it can't see a
+    // concurrent reject that commits between that read and this write. If
+    // this UPDATE matches zero rows, someone else already reviewed this
+    // request in the meantime, so roll back (undoing the users INSERT
+    // above too) instead of silently creating an account for a request
+    // that's actually REJECTED, or vice versa.
+    const [updateResult] = await connection.execute(
+      'UPDATE registration_requests SET status = ?, reviewed_at = NOW(), reviewed_by = ? WHERE id = ? AND status = ?',
+      ['APPROVED', req.user.id, id, 'PENDING']
     );
+
+    if (updateResult.affectedRows === 0) {
+      await connection.rollback();
+      return res.status(409).json({ success: false, message: 'This request has already been reviewed', errorCode: 'INVALID_STATE', timestamp: new Date().toISOString() });
+    }
 
     await connection.commit();
 
@@ -202,12 +226,23 @@ const rejectRegistrationRequest = async (req, res, next) => {
       return res.status(409).json({ success: false, message: 'This request has already been reviewed', errorCode: 'INVALID_STATE', timestamp: new Date().toISOString() });
     }
 
-    await connection.execute(
-      'UPDATE registration_requests SET status = ?, notes = ?, reviewed_at = NOW(), reviewed_by = ? WHERE id = ?',
-      ['REJECTED', notes?.trim() || null, req.user.id, id]
+    // Guarded on status = 'PENDING' — closes the same race approve() guards
+    // against: a concurrent approve() can commit between the read above and
+    // this write, and without this guard, this UPDATE would blindly stamp
+    // 'REJECTED' over an already-APPROVED request whose users row now
+    // exists — the audit trail would say rejected while the account is
+    // actually live.
+    const [updateResult] = await connection.execute(
+      'UPDATE registration_requests SET status = ?, notes = ?, reviewed_at = NOW(), reviewed_by = ? WHERE id = ? AND status = ?',
+      ['REJECTED', notes?.trim() || null, req.user.id, id, 'PENDING']
     );
 
     connection.release();
+
+    if (updateResult.affectedRows === 0) {
+      return res.status(409).json({ success: false, message: 'This request has already been reviewed', errorCode: 'INVALID_STATE', timestamp: new Date().toISOString() });
+    }
+
     res.json({ message: 'Registration request rejected' });
   } catch (error) {
     next(error);

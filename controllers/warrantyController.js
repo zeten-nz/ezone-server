@@ -95,9 +95,12 @@ const deleteWarrantyForm = async (req, res, next) => {
   try {
     const { formId } = req.params;
     connection = await pool.getConnection();
-    await warrantyService.deleteWarrantyForm(connection, formId);
+    await warrantyService.deleteWarrantyForm(connection, formId, req.user.id);
     res.json({ message: 'Warranty form deleted successfully' });
   } catch (error) {
+    if (error instanceof AppError) {
+      return sendAppError(res, error);
+    }
     next(error);
   } finally {
     if (connection) connection.release();
@@ -109,10 +112,14 @@ const getAllWarrantyForms = async (req, res, next) => {
     const page   = Math.max(1, parseInt(req.query.page,  10) || 1);
     const limit  = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
     const search = (req.query.search || '').trim();
+    // Optional installer drill-down (e.g. from Installer Statistics' "View
+    // warranties" link) — scopes this same admin list to one employee's
+    // warranties instead of a separate page/table.
+    const employeeId = req.query.employeeId ? parseInt(req.query.employeeId, 10) : undefined;
     const offset = (page - 1) * limit;
 
     const connection = await pool.getConnection();
-    const { rows, total } = await warrantyRepository.findAllPaginated(connection, { limit, offset, search });
+    const { rows, total } = await warrantyRepository.findAllPaginated(connection, { limit, offset, search, employeeId });
     const forms = await attachEquipment(connection, rows);
     connection.release();
 

@@ -96,6 +96,36 @@ async function ensureNullableColumn(connection, table, column, definition) {
 }
 
 /**
+ * Changes an existing foreign key's ON DELETE rule from CASCADE to RESTRICT.
+ * Used where an earlier CASCADE definition allowed a parent-row delete to
+ * silently destroy dependent rows with no warning — RESTRICT instead blocks
+ * the delete, matching how every other relationship into the parent table
+ * already behaves. Idempotent: no-ops once the constraint is already
+ * RESTRICT. The constraint name is discovered via information_schema rather
+ * than assumed, since CREATE TABLE never gave it an explicit name (MySQL
+ * auto-names it, e.g. `<table>_ibfk_<n>`).
+ */
+async function ensureForeignKeyRestrict(connection, table, column, referencedTable) {
+  const [rows] = await connection.execute(
+    `SELECT rc.CONSTRAINT_NAME, rc.DELETE_RULE
+     FROM information_schema.REFERENTIAL_CONSTRAINTS rc
+     JOIN information_schema.KEY_COLUMN_USAGE kcu
+       ON kcu.CONSTRAINT_NAME = rc.CONSTRAINT_NAME AND kcu.TABLE_SCHEMA = rc.CONSTRAINT_SCHEMA
+     WHERE rc.CONSTRAINT_SCHEMA = DATABASE() AND rc.TABLE_NAME = ?
+       AND kcu.COLUMN_NAME = ? AND kcu.REFERENCED_TABLE_NAME = ?`,
+    [table, column, referencedTable]
+  );
+  if (rows.length > 0 && rows[0].DELETE_RULE === 'CASCADE') {
+    const constraintName = rows[0].CONSTRAINT_NAME;
+    await connection.execute(`ALTER TABLE ${table} DROP FOREIGN KEY ${constraintName}`);
+    await connection.execute(
+      `ALTER TABLE ${table} ADD CONSTRAINT ${constraintName} FOREIGN KEY (${column}) REFERENCES ${referencedTable}(id) ON DELETE RESTRICT`
+    );
+    console.log(`[DB] Migration: changed ${table}.${column} FK to RESTRICT (was CASCADE)`);
+  }
+}
+
+/**
  * Renames a column while preserving its data — idempotent via checking the
  * OLD name first, so re-running after the rename already happened is a
  * no-op (the old name simply won't exist anymore). Used for columns whose
@@ -141,6 +171,25 @@ async function ensureIndexDropped(connection, table, indexName) {
 }
 
 /**
+ * Adds a plain (non-unique) index if it doesn't already exist — idempotent
+ * via information_schema.STATISTICS, mirroring ensureIndexDropped's
+ * check-first shape. `columns` is the full parenthesized column list, e.g.
+ * '(branch_id, status)'. Used for Phase 4's reporting/filtering indexes on
+ * tables that predate them.
+ */
+async function ensureIndexAdded(connection, table, indexName, columns) {
+  const [rows] = await connection.execute(
+    `SELECT COUNT(*) AS count FROM information_schema.STATISTICS
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = ?`,
+    [table, indexName]
+  );
+  if (rows[0].count === 0) {
+    await connection.execute(`ALTER TABLE ${table} ADD INDEX ${indexName} ${columns}`);
+    console.log(`[DB] Migration: added index ${table}.${indexName}`);
+  }
+}
+
+/**
  * Widens an ENUM column to include a new value — idempotent via parsing the
  * current COLUMN_TYPE from information_schema (e.g. "enum('A','B')") rather
  * than blindly re-running MODIFY COLUMN on every boot. Only ever adds a
@@ -175,8 +224,8 @@ async function backfillBranches(connection) {
     let seed = null;
     if (seedFromWarranty) {
       const [seedRows] = await connection.execute(
-        `SELECT wf.organization_name AS name, wf.organization_phone AS phone,
-                wf.region AS region, wf.city AS city, wf.district AS district
+        `SELECT wf.installer_branch AS name, wf.organization_phone AS phone,
+                wf.installer_region AS region, wf.city AS city, wf.installer_district AS district
          FROM warranty_forms wf
          JOIN users u ON wf.employee_id = u.id
          WHERE u.branch_code = ?
@@ -702,6 +751,241 @@ const initializeDatabase = async (loadMockData = false) => {
       connection, 'warranty_forms', 'car_id',
       'car_id INT NULL AFTER vehicle_name, ADD CONSTRAINT fk_warranty_forms_car FOREIGN KEY (car_id) REFERENCES cars(id)'
     );
+
+    // ── Inventory module (Phase 1) ───────────────────────────────────────────
+    // Physical-unit tracking on top of the EasyGas-synced products catalog.
+    // products stays sync-only (see products-architecture memory) — these
+    // tables extend it, never write to it. Creation order matters: batches
+    // before items (items.import_batch_id references it), items before
+    // status_history (history.inventory_item_id references it).
+    await connection.execute(`
+      CREATE TABLE IF NOT EXISTS inventory_import_batches (
+        id                INT PRIMARY KEY AUTO_INCREMENT,
+        product_id        INT NOT NULL,
+        uploaded_by       INT NOT NULL,
+        file_name         VARCHAR(255) NULL,
+        total_rows        INT NOT NULL DEFAULT 0,
+        imported_count    INT NOT NULL DEFAULT 0,
+        skipped_count     INT NOT NULL DEFAULT 0,
+        duplicate_count   INT NOT NULL DEFAULT 0,
+        error_count       INT NOT NULL DEFAULT 0,
+        created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (product_id) REFERENCES products(id),
+        FOREIGN KEY (uploaded_by) REFERENCES users(id)
+      ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+    `);
+
+    // barcode is globally UNIQUE (not scoped per product) — real serials are
+    // unique physical-unit identifiers; the same barcode legitimately
+    // existing under a different product later isn't a real case, it's a
+    // warehouse error that should surface as a hard conflict, not be allowed.
+    await connection.execute(`
+      CREATE TABLE IF NOT EXISTS inventory_items (
+        id                    INT PRIMARY KEY AUTO_INCREMENT,
+        product_id            INT NOT NULL,
+        barcode               VARCHAR(150) NOT NULL UNIQUE,
+        status                ENUM('IN_STOCK', 'RESERVED', 'INSTALLED', 'RETURNED', 'DAMAGED', 'LOST') NOT NULL DEFAULT 'IN_STOCK',
+        branch_id             INT NULL,
+        import_batch_id       INT NULL,
+        created_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_inventory_product_status (product_id, status),
+        FOREIGN KEY (product_id) REFERENCES products(id),
+        FOREIGN KEY (branch_id) REFERENCES branches(id),
+        FOREIGN KEY (import_batch_id) REFERENCES inventory_import_batches(id)
+      ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+    `);
+
+    // Every status transition, system- or admin-driven (changed_by NULL for
+    // the former). Written by claimForInstallation/release/changeStatus —
+    // never by a bare UPDATE elsewhere in the codebase.
+    await connection.execute(`
+      CREATE TABLE IF NOT EXISTS inventory_status_history (
+        id                INT PRIMARY KEY AUTO_INCREMENT,
+        inventory_item_id INT NOT NULL,
+        from_status       VARCHAR(20) NULL,
+        to_status         VARCHAR(20) NOT NULL,
+        changed_by        INT NULL,
+        reason            VARCHAR(255) NULL,
+        created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (inventory_item_id) REFERENCES inventory_items(id) ON DELETE CASCADE,
+        FOREIGN KEY (changed_by) REFERENCES users(id)
+      ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+    `);
+
+    // ── Inventory module (Phase 2) ───────────────────────────────────────────
+    // Links a warranty's equipment row to the specific physical unit claimed
+    // for it — nullable, since historical (pre-Phase-2) rows have none, and
+    // that's permanent, not a gap to backfill (see the Phase 2 plan).
+    // ON DELETE SET NULL: no path exists today to hard-delete an
+    // inventory_items row, but if one's ever added, note that
+    // equipmentRepository.upsertMany's change-detection compares
+    // serial_number, not this column — a future hard-delete would silently
+    // null this FK without that diff noticing. Not exploitable today.
+    await ensureColumn(
+      connection, 'warranty_equipment', 'inventory_item_id',
+      'inventory_item_id INT NULL AFTER serial_number, ADD CONSTRAINT fk_warranty_equipment_inventory_item FOREIGN KEY (inventory_item_id) REFERENCES inventory_items(id) ON DELETE SET NULL'
+    );
+
+    // ── Inventory module (Phase 3) — installer points ledger ────────────────
+    // Deliberately does NOT touch warranty_equipment's dormant reward_points/
+    // reward_transaction_id/etc. columns — those are reserved for a separate,
+    // still-unbuilt external STAG validation API integration (reward_transaction_id
+    // is a VARCHAR sized for an external API's id string, not an internal FK).
+    // No denormalized "current points" column anywhere either: the ledger is
+    // small enough that SUM(points) queries are always cheap and always
+    // correct, which avoids an entire class of cache-drift bug a stored
+    // balance would reintroduce.
+
+    // Current point value per product. Absence of a row means 0 (unconfigured),
+    // not a special NULL state — avoids a backfill migration touching every
+    // EasyGas-synced product. is_active gate/products.category etc. are all
+    // read from `products` directly; this table only ever holds the point value.
+    // product_id FK is RESTRICT, not CASCADE: a product with a configured
+    // point value is real, meaningful data — deleting the product must not
+    // silently wipe it out from under an admin. This matches how every
+    // other table referencing `products` already behaves (warranty_equipment/
+    // inventory_items/point_transactions/inventory_import_batches all
+    // RESTRICT, surfaced to the admin as "referenced by existing warranties,
+    // deactivate instead" in productController.js) — deleteProduct's own
+    // safety message was already promising this; CASCADE here silently
+    // broke that promise for products with only a point config and no
+    // warranty/inventory history.
+    await connection.execute(`
+      CREATE TABLE IF NOT EXISTS product_point_configs (
+        product_id  INT PRIMARY KEY,
+        points      INT NOT NULL DEFAULT 0,
+        updated_by  INT NULL,
+        updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE RESTRICT,
+        FOREIGN KEY (updated_by) REFERENCES users(id)
+      ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+    `);
+
+    // Audit trail for the config VALUE itself ("who changed the reducer from
+    // 20 to 30, when") — a different question from the point_transactions
+    // ledger below ("why does installer X have N points"). Never affects
+    // already-awarded points; those are frozen onto their own ledger rows.
+    // Same RESTRICT reasoning as product_point_configs above — an audit
+    // trail that CASCADE-deletes itself the moment its subject is deleted
+    // isn't an audit trail.
+    await connection.execute(`
+      CREATE TABLE IF NOT EXISTS product_point_config_history (
+        id          INT PRIMARY KEY AUTO_INCREMENT,
+        product_id  INT NOT NULL,
+        old_points  INT NULL,
+        new_points  INT NOT NULL,
+        changed_by  INT NOT NULL,
+        created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE RESTRICT,
+        FOREIGN KEY (changed_by) REFERENCES users(id)
+      ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+    `);
+
+    // Existing databases created these tables before the fix above — the
+    // CREATE TABLE IF NOT EXISTS text change alone does nothing for them,
+    // so their live FK constraints need altering explicitly.
+    await ensureForeignKeyRestrict(connection, 'product_point_configs', 'product_id', 'products');
+    await ensureForeignKeyRestrict(connection, 'product_point_config_history', 'product_id', 'products');
+
+    // The installer points ledger — append-only, never UPDATEd or DELETEd by
+    // any code path. warranty_form_id/warranty_equipment_id are ON DELETE SET
+    // NULL, not CASCADE: deleting a warranty must never delete its point
+    // history. `reason` is written as a frozen, human-readable string at
+    // creation time (e.g. "Warranty #152 — REDUCER — LANDIRENZO CN04"), so a
+    // row stays fully self-describing even after its FK targets go NULL post-
+    // deletion — mirrors the products.brand+brand_id / serial_number+
+    // inventory_item_id denormalization precedent already used twice in this
+    // codebase. idempotency_key is only ever set by manual adjustments
+    // (warranty-driven rows are already covered by submission_uuid's guard on
+    // the whole warranty transaction); MySQL allows multiple NULLs under a
+    // UNIQUE index, so that's safe.
+    await connection.execute(`
+      CREATE TABLE IF NOT EXISTS point_transactions (
+        id                      INT PRIMARY KEY AUTO_INCREMENT,
+        installer_id            INT NOT NULL,
+        points                  INT NOT NULL,
+        transaction_type        ENUM('WARRANTY_AWARD','WARRANTY_REVERSAL','MANUAL_ADJUSTMENT','MANUAL_BONUS','MANUAL_PENALTY') NOT NULL,
+        warranty_form_id        INT NULL,
+        warranty_equipment_id   INT NULL,
+        product_id              INT NULL,
+        reversed_transaction_id INT NULL,
+        reason                  VARCHAR(255) NULL,
+        idempotency_key         VARCHAR(100) NULL UNIQUE,
+        created_by              INT NOT NULL,
+        created_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (installer_id) REFERENCES users(id),
+        FOREIGN KEY (created_by) REFERENCES users(id),
+        FOREIGN KEY (warranty_form_id) REFERENCES warranty_forms(id) ON DELETE SET NULL,
+        FOREIGN KEY (warranty_equipment_id) REFERENCES warranty_equipment(id) ON DELETE SET NULL,
+        FOREIGN KEY (product_id) REFERENCES products(id),
+        FOREIGN KEY (reversed_transaction_id) REFERENCES point_transactions(id),
+        INDEX idx_point_transactions_installer (installer_id, created_at),
+        INDEX idx_point_transactions_warranty_equipment (warranty_equipment_id)
+      ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+    `);
+
+    // Super Admin permission tier: additive flag on top of the existing
+    // ADMIN role (not a 3rd ENUM value) — a Super Admin is "an Admin plus
+    // this capability flag," so every existing authorizeRole('ADMIN') check
+    // anywhere in the app keeps working unchanged. Only gates point-value
+    // configuration and manual point adjustments (see middleware/auth.js's
+    // requireSuperAdmin).
+    await ensureColumn(connection, 'users', 'is_super_admin', 'is_super_admin BOOLEAN NOT NULL DEFAULT FALSE AFTER role');
+
+    // ── Inventory module (Phase 4) — reporting, warehouse, manual ops ───────
+    // "Warehouse" is not a new entity — it's the existing `branches` table
+    // (confirmed decision, Phase 4 plan). inventory_items.branch_id already
+    // existed (added speculatively, never populated) — Phase 4 is what
+    // finally writes it, via CSV import and the new branch-transfer op.
+
+    // MERGED is a 6th terminal status for "this barcode was a duplicate of
+    // another real item" (see mergeDuplicate) — additive ENUM widen, same
+    // pattern as the earlier CONTROLLER category widen. merged_into_id
+    // points at the canonical item a duplicate was merged into; ON DELETE
+    // SET NULL since losing that pointer shouldn't cascade-delete the
+    // (already terminal, historical) duplicate row itself.
+    await ensureEnumValue(
+      connection, 'inventory_items', 'status',
+      `status ENUM('IN_STOCK','RESERVED','INSTALLED','RETURNED','DAMAGED','LOST','MERGED') NOT NULL DEFAULT 'IN_STOCK'`,
+      'MERGED'
+    );
+    await ensureColumn(
+      connection, 'inventory_items', 'merged_into_id',
+      'merged_into_id INT NULL AFTER branch_id, ADD CONSTRAINT fk_inventory_items_merged_into FOREIGN KEY (merged_into_id) REFERENCES inventory_items(id) ON DELETE SET NULL'
+    );
+
+    // Audit trail for the three manual corrections that don't fit
+    // inventory_status_history's from/to-status shape (branch transfer,
+    // barcode correction, merge) — manual STATUS changes keep using the
+    // existing insertStatusHistory path, not this table. reason is NOT NULL:
+    // every manual action here is human-triggered and must explain itself.
+    await connection.execute(`
+      CREATE TABLE IF NOT EXISTS inventory_audit_log (
+        id                INT PRIMARY KEY AUTO_INCREMENT,
+        inventory_item_id INT NOT NULL,
+        action_type       ENUM('BRANCH_TRANSFER', 'BARCODE_CORRECTED', 'MERGED_DUPLICATE') NOT NULL,
+        old_value         VARCHAR(255) NULL,
+        new_value         VARCHAR(255) NULL,
+        reason            VARCHAR(255) NOT NULL,
+        changed_by        INT NOT NULL,
+        created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (inventory_item_id) REFERENCES inventory_items(id) ON DELETE CASCADE,
+        FOREIGN KEY (changed_by) REFERENCES users(id),
+        INDEX idx_inventory_audit_item (inventory_item_id, created_at)
+      ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+    `);
+
+    // Reporting/filtering indexes for tables that predate Phase 4's query
+    // shapes (status breakdowns, warehouse-scoped stock, date-range
+    // filters, sync-status success %, points-over-time).
+    await ensureIndexAdded(connection, 'inventory_items', 'idx_inventory_branch_status', '(branch_id, status)');
+    await ensureIndexAdded(connection, 'inventory_status_history', 'idx_inventory_status_history_created_at', '(created_at)');
+    await ensureIndexAdded(connection, 'inventory_status_history', 'idx_inventory_status_history_item_created', '(inventory_item_id, created_at)');
+    await ensureIndexAdded(connection, 'warranty_forms', 'idx_warranty_forms_sync_status', '(easygas_sync_status)');
+    await ensureIndexAdded(connection, 'warranty_forms', 'idx_warranty_forms_installation_date', '(installation_date)');
+    await ensureIndexAdded(connection, 'point_transactions', 'idx_point_transactions_created_at', '(created_at)');
 
     // Only seed mock data when the database is completely empty AND the
     // LOAD_MOCK_DATA env var hasn't been set to 'false'.

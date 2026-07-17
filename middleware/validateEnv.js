@@ -29,6 +29,28 @@ const validateEnv = () => {
     process.exit(1);
   }
 
+  // ALLOWED_ORIGINS is only enforced in production. An empty/unset value
+  // combined with credentials:true in server.js's CORS config would allow
+  // every origin — acceptable for local development, never in production.
+  // Parsed the same way server.js parses it, so "set but empty/whitespace"
+  // (e.g. ALLOWED_ORIGINS=",  ,") is caught here too, not just "unset".
+  if (process.env.NODE_ENV === 'production') {
+    const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
+      .split(',')
+      .map((o) => o.trim())
+      .filter(Boolean);
+
+    if (allowedOrigins.length === 0) {
+      console.error(
+        '[STARTUP ERROR] ALLOWED_ORIGINS is required when NODE_ENV=production ' +
+        '(comma-separated list of allowed frontend origins, e.g. ' +
+        'https://ezone.yourdomain.com). Refusing to start with an open CORS ' +
+        'policy — see .env.example.'
+      );
+      process.exit(1);
+    }
+  }
+
   // Warn loudly if someone ships to production with the placeholder JWT secret
   if (process.env.JWT_SECRET === 'your_jwt_secret_key_change_in_production') {
     console.warn(

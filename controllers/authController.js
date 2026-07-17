@@ -113,7 +113,7 @@ const login = async (req, res, next) => {
       }
 
       const token = jwt.sign(
-        { id: user.id, username: user.username, role: user.role, full_name: user.full_name },
+        { id: user.id, username: user.username, role: user.role, full_name: user.full_name, is_super_admin: !!user.is_super_admin },
         process.env.JWT_SECRET,
         { expiresIn: process.env.JWT_EXPIRE || '7d' }
       );
@@ -130,6 +130,7 @@ const login = async (req, res, next) => {
           full_name: user.full_name,
           username: user.username,
           role: user.role,
+          is_super_admin: !!user.is_super_admin,
           phone: user.phone,
           branch_code: user.branch_code,
         },
@@ -235,7 +236,7 @@ const getProfile = async (req, res, next) => {
       `SELECT u.id, u.full_name, u.first_name, u.last_name, u.username, u.phone, u.region, u.district,
               u.branch_code, u.branch_id, b.name AS branch_name, b.phone AS branch_phone,
               b.region AS branch_region, b.city AS branch_city, b.district AS branch_district,
-              u.photo_filename, u.role, u.is_active, u.last_login_at, u.created_at
+              u.photo_filename, u.role, u.is_super_admin, u.is_active, u.last_login_at, u.created_at
        FROM users u LEFT JOIN branches b ON u.branch_id = b.id
        WHERE u.id = ?`,
       [userId]
@@ -294,7 +295,23 @@ const streamProfilePhoto = async (req, res, next) => {
 
     res.setHeader('Content-Type', contentType);
     res.setHeader('Cache-Control', 'private, no-store');
-    fs.createReadStream(filePath).pipe(res);
+
+    // A concurrent request can delete this exact file between the
+    // existsSync() check above and the stream actually opening it (e.g. the
+    // owner replaces/removes their photo via updateProfilePhoto/
+    // removeProfilePhoto, which unlink the old file right after committing
+    // the DB change) — .pipe() does NOT forward source-stream errors to the
+    // response, so an unhandled 'error' here throws and crashes the whole
+    // process. Must be handled explicitly, not left to propagate.
+    const stream = fs.createReadStream(filePath);
+    stream.on('error', () => {
+      if (!res.headersSent) {
+        res.status(404).json({ success: false, message: 'Photo not found', errorCode: 'NOT_FOUND', timestamp: new Date().toISOString() });
+      } else {
+        res.end();
+      }
+    });
+    stream.pipe(res);
   } catch (error) {
     next(error);
   }

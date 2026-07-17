@@ -25,13 +25,22 @@ const upsertMany = async (connection, warrantyFormId, equipmentRows) => {
     // (warranty_forms.fuel_type), not per-equipment-row. The column stays
     // on this table for historical rows only (see the fuel_type migration
     // in config/database.js); new rows simply never populate it.
+    //
+    // inventory_item_id: this function does NOT decide whether to
+    // claim/release an inventory item — that decision (and the actual
+    // claim/release side effect) is made one layer up, in warrantyService,
+    // before upsertMany is ever called (see the Phase 2 plan's Critical
+    // Review #3 — deliberately not folding a second diff into this
+    // function's existing valueChanged check). This just writes whatever
+    // final value the caller already resolved.
     await connection.execute(
-      `INSERT INTO warranty_equipment (warranty_form_id, equipment_type, product_id, product_name, serial_number)
-       VALUES (?, ?, ?, ?, ?)
+      `INSERT INTO warranty_equipment (warranty_form_id, equipment_type, product_id, product_name, serial_number, inventory_item_id)
+       VALUES (?, ?, ?, ?, ?, ?)
        ON DUPLICATE KEY UPDATE
          product_id = VALUES(product_id),
-         product_name = VALUES(product_name), serial_number = VALUES(serial_number)${resetClause}`,
-      [warrantyFormId, row.equipment_type, row.product_id, row.product_name, row.serial_number || null]
+         product_name = VALUES(product_name), serial_number = VALUES(serial_number),
+         inventory_item_id = VALUES(inventory_item_id)${resetClause}`,
+      [warrantyFormId, row.equipment_type, row.product_id, row.product_name, row.serial_number || null, row.inventory_item_id || null]
     );
   }
 };
@@ -48,7 +57,7 @@ const findByWarrantyFormIds = async (connection, formIds) => {
   if (formIds.length === 0) return [];
   const placeholders = formIds.map(() => '?').join(',');
   const [rows] = await connection.execute(
-    `SELECT we.*, p.brand AS product_brand, p.external_id AS product_external_id
+    `SELECT we.*, p.brand AS product_brand, p.external_id AS product_external_id, p.category AS product_category
      FROM warranty_equipment we
      LEFT JOIN products p ON p.id = we.product_id
      WHERE we.warranty_form_id IN (${placeholders})

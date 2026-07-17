@@ -82,6 +82,10 @@ const branchRoutes                    = require('./routes/branchRoutes');
 const productRoutes                   = require('./routes/productRoutes');
 const reportsRoutes                   = require('./routes/reportsRoutes');
 const carRoutes                       = require('./routes/carRoutes');
+const inventoryRoutes                 = require('./routes/inventoryRoutes');
+const pointsRoutes                    = require('./routes/pointsRoutes');
+const exportCsvRoutes                 = require('./routes/exportCsvRoutes');
+const publicCustomerRoutes            = require('./routes/publicCustomerRoutes');
 const { exportWarrantyForms, exportByBranch, exportEmployeeData } =
   require('./controllers/excelController');
 const { verifyToken, authorizeRole }  = require('./middleware/auth');
@@ -112,20 +116,25 @@ app.use(helmet());
 const allowedOrigins = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',').map((o) => o.trim()).filter(Boolean)
   : [];
+const isProduction = process.env.NODE_ENV === 'production';
 
 app.use(
   cors({
     origin: (origin, callback) => {
       // No origin = non-browser client (Postman, mobile app, server-to-server)
       if (!origin) return callback(null, true);
-      if (allowedOrigins.length === 0 || allowedOrigins.includes(origin)) {
-        return callback(null, true);
-      }
+      if (allowedOrigins.includes(origin)) return callback(null, true);
+      // "No ALLOWED_ORIGINS configured = allow anything" is a development-only
+      // convenience. It never applies in production: validateEnv() (see
+      // middleware/validateEnv.js) already refuses to start in production
+      // with an empty ALLOWED_ORIGINS, and this check is a second, explicit
+      // guard against ever silently falling open — no wildcard fallback.
+      if (!isProduction && allowedOrigins.length === 0) return callback(null, true);
       callback(new Error(`CORS: origin '${origin}' not allowed`));
     },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization']
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Language']
   })
 );
 
@@ -143,14 +152,40 @@ app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 // ── [6a] GLOBAL RATE LIMITER ──────────────────────────────────────────────────
 // 100 requests per 15 minutes per IP across all /api routes.
 // Returns 429 Too Many Requests when exceeded.
+//
+// /api/reports is exempted here and given its own, more generous limiter
+// below: the reports dashboard legitimately fires ~10 concurrent GET
+// requests per render (one per report/statistic section — dashboard totals,
+// points leaderboard, top warehouses, recent activity, etc.) and again on
+// every period change, all from an already-authenticated, ADMIN-only route.
+// A single admin exploring a few time periods can exceed 100 requests in
+// well under 15 minutes on completely legitimate traffic — that's the
+// reported "reports page randomly returns 429," not abuse. req.originalUrl
+// is used (not req.path) since this middleware is mounted at '/api' and
+// req.path would already have that prefix stripped.
 const globalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,  // 15 minutes
   max: 100,
   standardHeaders: true,      // Sends RateLimit-* response headers (RFC 6585)
   legacyHeaders: false,       // Omits deprecated X-RateLimit-* headers
+  skip: (req) => req.originalUrl.startsWith('/api/reports'),
   message: { message: 'Too many requests, please try again in 15 minutes.' }
 });
 app.use('/api', globalLimiter);
+
+// Reports-specific limiter — still a real, enforced cap (protects against a
+// genuine runaway loop or bug), just sized for this route's actual usage
+// pattern instead of the public-facing default. Every /api/reports endpoint
+// already requires verifyToken + authorizeRole('ADMIN'), so this is not a
+// wider-open door than the rest of the API, just a correctly-sized one.
+const reportsLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 500,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many requests, please try again in 15 minutes.' }
+});
+app.use('/api/reports', reportsLimiter);
 
 // ── [6b] AUTH-SPECIFIC RATE LIMITER ──────────────────────────────────────────
 // The login endpoint is the primary target for credential-stuffing attacks.
@@ -199,6 +234,10 @@ app.use('/api/branches', branchRoutes);
 app.use('/api/products', productRoutes);
 app.use('/api/reports', reportsRoutes);
 app.use('/api/cars', carRoutes);
+app.use('/api/inventory', inventoryRoutes);
+app.use('/api/points', pointsRoutes);
+app.use('/api/export-csv', exportCsvRoutes);
+app.use('/api/public/customer', publicCustomerRoutes);
 app.get('/api/export/warranty', verifyToken, authorizeRole('ADMIN'), exportWarrantyForms);
 app.get('/api/export/branch',   verifyToken, authorizeRole('ADMIN'), exportByBranch);
 app.get('/api/export/employee', verifyToken, exportEmployeeData);
@@ -312,7 +351,12 @@ const startServer = async () => {
   try {
     // Initialize DB tables and optionally seed mock data before binding the port.
     // This ensures the server is never reachable before the schema is ready.
-    const loadMockData = process.env.LOAD_MOCK_DATA !== 'false';
+    //
+    // LOAD_MOCK_DATA defaults to false (opt-in, not opt-out) and is hard-disabled
+    // in production regardless of its value — a fresh/empty production database
+    // must never receive demo accounts with well-known passwords. Development
+    // is unaffected: set LOAD_MOCK_DATA=true locally to seed a fresh dev DB.
+    const loadMockData = !isProduction && process.env.LOAD_MOCK_DATA === 'true';
     await initializeDatabase(loadMockData);
 
     // Starts the EasyGas retry sweep — the only path that pushes a warranty

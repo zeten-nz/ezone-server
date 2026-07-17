@@ -6,10 +6,11 @@ const {
   updateUser,
   disableUser,
   enableUser,
+  setSuperAdmin,
   resetPassword,
   getUser
 } = require('../controllers/userController');
-const { verifyToken, authorizeRole } = require('../middleware/auth');
+const { verifyToken, authorizeRole, requireSuperAdmin } = require('../middleware/auth');
 
 const router = express.Router();
 
@@ -35,6 +36,12 @@ router.put('/:userId', [
 
 router.patch('/:userId/disable', disableUser);
 router.patch('/:userId/enable', enableUser);
+
+// Super Admin only — grants/revokes the points-configuration/manual-
+// adjustment capability on another Admin account (see middleware/auth.js).
+router.patch('/:userId/super-admin', requireSuperAdmin, [
+  body('isSuperAdmin').isBoolean().withMessage('isSuperAdmin must be a boolean'),
+], setSuperAdmin);
 
 router.post('/:userId/reset-password', [
   body('newPassword').isLength({ min: 6 }).withMessage('Password must be at least 6 characters')
