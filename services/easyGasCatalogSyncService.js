@@ -9,8 +9,10 @@
  * no benefit).
  *
  * Every field mapping in this file was confirmed against real responses
- * pulled directly from https://admin.stag.uz/public/api (all 9 product
- * pages / 179 products, all 26 brands, all 409 cars) — not guessed.
+ * pulled directly from EasyGas's signed catalog endpoints (same base/secret
+ * as the warranty push — see easyGasCatalogClient.js), not guessed: real
+ * /branches, /products (component_type, station_type, product_brand_id,
+ * product_category_id, updated_at), /cars, and /brands responses.
  */
 const easyGasCatalogClient = require('./easyGasCatalogClient');
 const { mapExternalCategory } = require('../config/externalCategoryMap');
@@ -19,15 +21,13 @@ const PAGE_SIZE = 100; // confirmed real max — per_page > 100 gets HTTP 422 "m
 
 /**
  * Walks every page of a Laravel-paginated EasyGas catalog endpoint.
- * Confirmed shape for /products: `{data: [...], links: {...},
- * meta: {current_page, last_page, per_page, total, ...}}`. /cars returns
- * everything in one unpaginated `{data: [...]}` response (no `meta` at
- * all — confirmed by requesting page=2 and getting the identical rows back)
- * — this still works correctly here since `meta?.last_page || 1` naturally
- * collapses to a single page. Stops as soon as a page fails (network error
- * or non-2xx) instead of skipping ahead, so a mid-walk failure just means
- * "try again next sweep cycle," never a silent gap. Deliberately NOT used
- * for brands — see syncBrands.
+ * Confirmed live against the signed /products and /cars endpoints: standard
+ * Laravel paginate() shape, every field top-level —
+ * `{current_page, data: [...], last_page, per_page, total, ...}` — no
+ * `meta`/`links` wrapper. Stops as soon as a page fails (network error or
+ * non-2xx) instead of skipping ahead, so a mid-walk failure just means "try
+ * again next sweep cycle," never a silent gap. Deliberately NOT used for
+ * brands — see syncBrands.
  */
 const walkPaginatedCatalog = async (fetchPage, onPage) => {
   let page = 1;
@@ -36,17 +36,26 @@ const walkPaginatedCatalog = async (fetchPage, onPage) => {
     if (!result.ok) return { ok: false };
     const rows = result.data?.data || [];
     await onPage(rows);
-    const lastPage = result.data?.meta?.last_page || 1;
+    // Confirmed live against the signed endpoint: last_page is a top-level
+    // field on the standard Laravel paginate() response (current_page, data,
+    // last_page, per_page, total, ...) — there is no meta wrapper. Reading
+    // result.data?.meta?.last_page (correct for the old, retired public
+    // catalog API) always evaluated to undefined here, silently capping
+    // every sync at page 1.
+    const lastPage = result.data?.last_page || 1;
     if (page >= lastPage) return { ok: true };
     page += 1;
   }
 };
 
-// `updated_since` is confirmed to have NO effect (tested with a future date —
-// still returned the full catalog), so it's never sent in requests below.
-// The sync_state checkpoint is still recorded for basic "when did this last
-// run successfully" visibility, but nothing reads it back to filter a
-// request anymore.
+// `updated_since` is deliberately never sent below — every cycle does a full
+// walk instead. This isn't just an optimization tradeoff: EasyGas's catalog
+// has no soft-deletes, so a deleted product can never appear in an
+// updated_since-filtered response at all (no row left to carry a timestamp).
+// Only a full pull lets syncProducts/syncCars detect and deactivate rows
+// that vanished (see the deactivation step at the end of each). The
+// sync_state checkpoint is still recorded for basic "when did this last run
+// successfully" visibility, but nothing reads it back to filter a request.
 const getSyncCheckpoint = async (pool, key) => {
   const [rows] = await pool.execute('SELECT last_synced_at FROM sync_state WHERE sync_key = ?', [key]);
   return rows[0]?.last_synced_at || null;
@@ -187,7 +196,7 @@ const upsertProduct = async (pool, product) => {
     `INSERT INTO products (external_id, category, brand_id, brand, model, fuel_type, synced_at, is_active)
      VALUES (?, ?, ?, ?, ?, ?, NOW(), TRUE)
      ON DUPLICATE KEY UPDATE category = VALUES(category), brand_id = VALUES(brand_id), brand = VALUES(brand),
-       model = VALUES(model), fuel_type = VALUES(fuel_type), synced_at = VALUES(synced_at)`,
+       model = VALUES(model), fuel_type = VALUES(fuel_type), synced_at = VALUES(synced_at), is_active = TRUE`,
     [String(product.id), category, brand.id, brand.name, model, fuelType]
   );
   return { inserted: true };
@@ -195,7 +204,15 @@ const upsertProduct = async (pool, product) => {
 
 const syncProducts = async (pool) => {
   await getSyncCheckpoint(pool, 'products'); // recorded for visibility only, not used to filter the request (see note above)
-  const startedAt = new Date();
+  // Read the cycle's start time FROM MySQL itself (never Node's own
+  // new Date()) so it's compared against synced_at through the exact same
+  // connection/driver timezone assumption, whatever that happens to be —
+  // self-consistent regardless of whether the caller's pool forces UTC.
+  // Confirmed the hard way: a pool without timezone: '+00:00' forced (an
+  // ad-hoc test connection, not this app's real pool) mismatched a JS Date
+  // parameter against stored TIMESTAMP values badly enough to mark every
+  // just-synced row "stale" in the same cycle it was upserted.
+  const [[{ startedAt }]] = await pool.execute('SELECT NOW() AS startedAt');
   let imported = 0;
   let skippedCategory = 0;
   let skippedBrand = 0;
@@ -219,6 +236,21 @@ const syncProducts = async (pool) => {
     }
   );
   if (!walk.ok) return { ok: false };
+
+  // Deletion detection: EasyGas's catalog has no soft-deletes, so a deleted
+  // product simply never appears in this (or any) pull again — the only way
+  // to notice is a full walk that completed successfully (guaranteed above
+  // by `walk.ok`) finding a local, EasyGas-sourced row it never touched.
+  // Every row actually upserted this cycle got synced_at = NOW() (>=
+  // startedAt); anything older that's still marked active genuinely vanished.
+  // resolveEquipment already rejects an inactive product and
+  // productRepository.search already filters is_active = TRUE, so this alone
+  // is enough to stop a vanished product from being used in a new warranty.
+  await pool.execute(
+    'UPDATE products SET is_active = FALSE WHERE external_id IS NOT NULL AND is_active = TRUE AND synced_at < ?',
+    [startedAt]
+  );
+
   await setSyncCheckpoint(pool, 'products', startedAt);
   return {
     ok: true,
@@ -231,17 +263,20 @@ const syncProducts = async (pool) => {
 
 /**
  * cars is its own upsert shape, not shared with upsertProduct — flat
- * brand/model strings (no brand_id FK, no category). Confirmed real fields:
- * id, brand_id (EasyGas's own, not resolved against our brands table here —
- * out of scope of this fix), brand_name, name — there is no `brand`, no
- * `model`, and no `updated_at` field, unlike the old guessed mapping assumed.
+ * brand/model strings (no brand_id FK, no category). Confirmed real fields
+ * on the signed endpoint: id, brand_id (EasyGas's own, not resolved against
+ * our brands table here — out of scope of this fix), brand_name, name,
+ * updated_at — there is no separate `model` field, `name` carries it.
+ * `is_active` reactivates on re-upsert (mirrors upsertProduct) so a car that
+ * was deactivated by a past sync's deletion-detection step and later
+ * reappears isn't stuck inactive forever.
  */
 const upsertCar = async (pool, car) => {
   if (!car?.id || !car?.brand_name || !car?.name) return false;
   await pool.execute(
-    `INSERT INTO cars (external_id, brand, model, synced_at)
-     VALUES (?, ?, ?, NOW())
-     ON DUPLICATE KEY UPDATE brand = VALUES(brand), model = VALUES(model), synced_at = VALUES(synced_at)`,
+    `INSERT INTO cars (external_id, brand, model, synced_at, is_active)
+     VALUES (?, ?, ?, NOW(), TRUE)
+     ON DUPLICATE KEY UPDATE brand = VALUES(brand), model = VALUES(model), synced_at = VALUES(synced_at), is_active = TRUE`,
     [String(car.id), car.brand_name, car.name]
   );
   return true;
@@ -249,7 +284,7 @@ const upsertCar = async (pool, car) => {
 
 const syncCars = async (pool) => {
   await getSyncCheckpoint(pool, 'cars'); // recorded for visibility only, see note above
-  const startedAt = new Date();
+  const [[{ startedAt }]] = await pool.execute('SELECT NOW() AS startedAt'); // see syncProducts for why not new Date()
   let imported = 0;
   let skipped = 0;
   const walk = await walkPaginatedCatalog(
@@ -262,6 +297,13 @@ const syncCars = async (pool) => {
     }
   );
   if (!walk.ok) return { ok: false };
+
+  // Deletion detection — same reasoning as syncProducts above.
+  await pool.execute(
+    'UPDATE cars SET is_active = FALSE WHERE external_id IS NOT NULL AND is_active = TRUE AND synced_at < ?',
+    [startedAt]
+  );
+
   await setSyncCheckpoint(pool, 'cars', startedAt);
   return { ok: true, imported, skipped };
 };

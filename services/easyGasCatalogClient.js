@@ -1,8 +1,11 @@
-// EasyGas's public product catalog API — confirmed separate from, and with a
-// different base URL than, their private HMAC-signed warranty-submission API
-// (see easyGasWarrantyClient.js). These endpoints are public and require no
-// signing at all.
-const BASE_URL = process.env.EASYGAS_CATALOG_API_BASE_URL;
+const { buildSignedHeaders } = require('../utils/easyGasSigning');
+
+// EasyGas's catalog API — per EasyGas's own request, now shares the SAME
+// signed base URL/secret as the private warranty-submission API (see
+// easyGasWarrantyClient.js), replacing the old separate, unsigned public
+// catalog API. EASYGAS_CATALOG_API_BASE_URL is retired; do not reintroduce it.
+const BASE_URL = process.env.EASYGAS_WARRANTY_API_BASE_URL;
+const SHARED_SECRET = process.env.EASYGAS_SHARED_SECRET;
 const REQUEST_TIMEOUT_MS = 3000;
 
 const toQueryString = (params) => {
@@ -25,9 +28,11 @@ const request = async (method, path) => {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   try {
+    // GET-only client — every request signs an empty body.
+    const signedHeaders = buildSignedHeaders(SHARED_SECRET, '');
     const response = await fetch(`${BASE_URL}${path}`, {
       method,
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...signedHeaders },
       signal: controller.signal,
     });
     const data = await response.json().catch(() => null);
@@ -40,8 +45,15 @@ const request = async (method, path) => {
 };
 
 const getProducts = (params) => request('GET', `/products${toQueryString(params)}`);
-// Confirmed path is /product-brands, not /brands.
-const getProductBrands = (params) => request('GET', `/product-brands${toQueryString(params)}`);
+// Path is /brands under the new signed API — distinct from the old public
+// API's /product-brands, since this is a different endpoint family.
+const getProductBrands = (params) => request('GET', `/brands${toQueryString(params)}`);
 const getCars = (params) => request('GET', `/cars${toQueryString(params)}`);
+// New endpoint EasyGas mentioned for real STAG branch codes. Deliberately
+// NOT wired into easyGasCatalogSyncService.js/easyGasCatalogSyncSweep.js in
+// this batch — branches.easygas_stag_code is a manually ops-entered value
+// (see config/database.js), not something auto-synced yet. Exposed here so
+// a future sync can use it.
+const getBranches = (params) => request('GET', `/branches${toQueryString(params)}`);
 
-module.exports = { getProducts, getProductBrands, getCars };
+module.exports = { getProducts, getProductBrands, getCars, getBranches };

@@ -92,6 +92,11 @@ const findOwnershipInfo = async (connection, formId) => {
   return rows[0] || null;
 };
 
+const findBySubmissionUuid = async (connection, submissionUuid) => {
+  const [rows] = await connection.execute('SELECT id FROM warranty_forms WHERE submission_uuid = ?', [submissionUuid]);
+  return rows[0]?.id || null;
+};
+
 /**
  * Acquires a row lock on this warranty for the duration of the caller's
  * transaction, serializing concurrent update/delete operations on the SAME
@@ -111,13 +116,24 @@ const lockForm = async (connection, formId) => {
 // `employeeId` scopes the admin list to one installer's warranties (e.g. an
 // "open installer" drill-down from statistics) — optional, combined with
 // `search`/pagination exactly like every other admin list filter, not a
-// separate endpoint or table.
-const findAllPaginated = async (connection, { limit, offset, search, employeeId }) => {
+// separate endpoint or table. `verificationStatus` is the Manual Verification
+// workflow's admin filter (e.g. "show me every warranty with a row still
+// PENDING review") — an EXISTS against warranty_equipment, since the status
+// itself lives per equipment row, not on this table (see the migration's
+// reasoning in config/database.js).
+const findAllPaginated = async (connection, { limit, offset, search, employeeId, verificationStatus }) => {
   const conditions = [];
   const filterParams = [];
   if (employeeId) {
     conditions.push('wf.employee_id = ?');
     filterParams.push(employeeId);
+  }
+  if (verificationStatus) {
+    conditions.push(`EXISTS (
+      SELECT 1 FROM warranty_equipment we
+      WHERE we.warranty_form_id = wf.id AND we.verification_status = ?
+    )`);
+    filterParams.push(verificationStatus);
   }
   if (search) {
     conditions.push('(wf.vehicle_plate_number LIKE ? OR wf.owner_full_name LIKE ? OR u.full_name LIKE ?)');
@@ -165,27 +181,6 @@ const findDetailById = async (connection, formId) => {
   return rows[0] || null;
 };
 
-/**
- * For the customer-facing warranty-lookup endpoint (controllers/
- * publicCustomerController.js) — the caller has already authenticated the
- * customer on their own platform and sends us only a phone number; we
- * search exactly by owner_phone, never by employee_id or any staff
- * identity. No `users` join (unlike findDetailById/findAllPaginated):
- * this caller has no use for — and shouldn't see — the installer's login
- * username, only the installer_* snapshot columns already on this table.
- */
-const findByOwnerPhone = async (connection, ownerPhone) => {
-  const [rows] = await connection.execute(
-    `SELECT wf.*, ${FUEL_TYPE_SELECT}
-     FROM warranty_forms wf
-     ${FUEL_TYPE_JOIN}
-     WHERE wf.owner_phone = ?
-     ORDER BY wf.created_at DESC`,
-    [ownerPhone]
-  );
-  return rows;
-};
-
 const searchForms = async (connection, { search, filterType }) => {
   let query = `SELECT wf.*, u.full_name AS employee_name, u.username AS employee_username, ${FUEL_TYPE_SELECT}
                FROM warranty_forms wf JOIN users u ON wf.employee_id = u.id
@@ -223,15 +218,70 @@ const searchForms = async (connection, { search, filterType }) => {
  * no sense. Clears easygas_sync_terminal/easygas_last_error too — if the
  * underlying data was corrected, the next sweep attempt deserves a clean
  * slate, not a stale terminal flag lingering until the new attempt resolves.
+ *
+ * Manual Verification workflow — the NOT EXISTS guard below is deliberately
+ * baked into this shared function's own WHERE clause, not left to each
+ * caller to remember: a warranty with any row still PENDING or REJECTED
+ * must never become sync-eligible again, no matter which caller resets it
+ * (today: warrantyController.retryWarrantySync and
+ * warrantyService.updateWarrantyForm's own "no longer blocked" check; any
+ * future caller is protected the same way automatically, since the
+ * restriction lives in the query itself, not in caller-side judgment).
+ * APPROVED rows are unaffected — only PENDING (unreviewed) and REJECTED
+ * (a deliberate decision that this equipment isn't a confirmed installation)
+ * block a reset; the same rows easyGasSyncSweep.js's candidate query already
+ * excludes for PENDING, extended here to also cover REJECTED for this
+ * specific "someone is trying to force it back to PENDING" action.
  */
 const resetSyncStatus = async (connection, formId) => {
   const [result] = await connection.execute(
     `UPDATE warranty_forms
      SET easygas_sync_status = 'PENDING', easygas_sync_terminal = FALSE, easygas_last_error = NULL
-     WHERE id = ? AND easygas_sync_status = 'FAILED'`,
+     WHERE id = ? AND easygas_sync_status = 'FAILED'
+       AND NOT EXISTS (
+         SELECT 1 FROM warranty_equipment we
+         WHERE we.warranty_form_id = warranty_forms.id AND we.verification_status IN ('PENDING', 'REJECTED')
+       )`,
     [formId]
   );
   return result.affectedRows === 1;
+};
+
+/**
+ * Diagnostic-only helper for retryWarrantySync's controller — resetSyncStatus
+ * above is what actually enforces the block (this function grants no
+ * capability and is never a security boundary itself); this just lets the
+ * controller tell an admin *why* a reset didn't happen (still FAILED-but-
+ * blocked vs. not FAILED at all) instead of one generic message covering both.
+ */
+const hasUnresolvedManualVerification = async (connection, formId) => {
+  const [rows] = await connection.execute(
+    `SELECT 1 FROM warranty_equipment WHERE warranty_form_id = ? AND verification_status IN ('PENDING', 'REJECTED') LIMIT 1`,
+    [formId]
+  );
+  return rows.length > 0;
+};
+
+/**
+ * Manual Verification workflow — called only from warrantyService.
+ * reviewManualVerification's reject branch, immediately after
+ * equipmentRepository.reviewVerification has already guarded-and-flipped
+ * that one row to REJECTED. Reuses the exact terminal-FAILED vocabulary
+ * backfillEasyGasSkipLegacyWarranties (config/database.js) already
+ * established for "this warranty will never sync, by design, not by
+ * transient error" — no new sync-status enum value needed. Unconditional
+ * (no status guard): a warranty with any row still able to be rejected can
+ * never have already reached SYNCED (the sweep's NOT EXISTS gate keeps it at
+ * PENDING for as long as that row stays PENDING — see easyGasSyncSweep.js),
+ * so there is no state this could incorrectly overwrite.
+ */
+const markSyncTerminal = async (connection, formId, message) => {
+  await connection.execute(
+    `UPDATE warranty_forms
+     SET easygas_sync_status = 'FAILED', easygas_sync_terminal = TRUE, easygas_last_error = ?
+     WHERE id = ?`,
+    [message.slice(0, 255), formId]
+  );
 };
 
 const deleteById = async (connection, formId) => {
@@ -274,13 +324,15 @@ module.exports = {
   insert,
   update,
   findOwnershipInfo,
+  findBySubmissionUuid,
   lockForm,
   findAllPaginated,
   findMinePaginated,
-  findByOwnerPhone,
   findDetailById,
   searchForms,
   resetSyncStatus,
+  hasUnresolvedManualVerification,
+  markSyncTerminal,
   deleteById,
   findChunkForExport,
 };

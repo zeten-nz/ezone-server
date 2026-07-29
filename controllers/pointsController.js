@@ -80,6 +80,45 @@ const getProductConfigs = async (req, res, next) => {
   }
 };
 
+// ADMIN (view) — the typed-cylinder point value (the only equipment slot
+// that can currently be submitted with no catalog product).
+const getEquipmentTypeConfigs = async (req, res, next) => {
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    const rows = await pointsService.listEquipmentTypeConfigs(connection);
+    res.json({ data: rows });
+  } catch (error) {
+    next(error);
+  } finally {
+    if (connection) connection.release();
+  }
+};
+
+// Super Admin only — same permission tier as setProductConfig.
+const setEquipmentTypeConfig = async (req, res, next) => {
+  let connection;
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, message: errors.array()[0].msg, errorCode: 'VALIDATION_ERROR', timestamp: new Date().toISOString() });
+    }
+
+    const { equipmentType } = req.params;
+    const { points } = req.body;
+    connection = await pool.getConnection();
+    await pointsService.setEquipmentTypeConfig(connection, { equipmentType, points, updatedBy: req.user.id });
+    res.json({ message: 'Point value updated successfully' });
+  } catch (error) {
+    if (error instanceof AppError) {
+      return sendAppError(res, error);
+    }
+    next(error);
+  } finally {
+    if (connection) connection.release();
+  }
+};
+
 // Super Admin only — sets a product's current point value going forward;
 // never touches already-awarded points (those are frozen onto their own
 // ledger rows).
@@ -141,5 +180,7 @@ module.exports = {
   getInstallerPoints,
   getProductConfigs,
   setProductConfig,
+  getEquipmentTypeConfigs,
+  setEquipmentTypeConfig,
   createAdjustment,
 };

@@ -85,7 +85,6 @@ const carRoutes                       = require('./routes/carRoutes');
 const inventoryRoutes                 = require('./routes/inventoryRoutes');
 const pointsRoutes                    = require('./routes/pointsRoutes');
 const exportCsvRoutes                 = require('./routes/exportCsvRoutes');
-const publicCustomerRoutes            = require('./routes/publicCustomerRoutes');
 const { exportWarrantyForms, exportByBranch, exportEmployeeData } =
   require('./controllers/excelController');
 const { verifyToken, authorizeRole }  = require('./middleware/auth');
@@ -237,7 +236,6 @@ app.use('/api/cars', carRoutes);
 app.use('/api/inventory', inventoryRoutes);
 app.use('/api/points', pointsRoutes);
 app.use('/api/export-csv', exportCsvRoutes);
-app.use('/api/public/customer', publicCustomerRoutes);
 app.get('/api/export/warranty', verifyToken, authorizeRole('ADMIN'), exportWarrantyForms);
 app.get('/api/export/branch',   verifyToken, authorizeRole('ADMIN'), exportByBranch);
 app.get('/api/export/employee', verifyToken, exportEmployeeData);
@@ -367,6 +365,13 @@ const startServer = async () => {
     // until the real credentials arrive at go-live.
     const { startEasyGasSyncSweep } = require('./services/easyGasSyncSweep');
     startEasyGasSyncSweep(pool);
+
+    // Manual Verification workflow — removes photo uploads that were never
+    // attached to a warranty (abandoned form, or replaced before saving).
+    // Same crash-safety contract as the sweep above; a 24h grace period
+    // means nothing mid-form-fill is ever at risk.
+    const { startManualVerificationUploadCleanupSweep } = require('./services/manualVerificationUploadCleanupSweep');
+    startManualVerificationUploadCleanupSweep(pool);
 
     // Starts the EasyGas catalog sync (brands/products/cars) — same
     // crash-safety contract, safe to start pre-go-live (every cycle just

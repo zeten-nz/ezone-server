@@ -9,8 +9,13 @@ const {
   searchWarrantyForms,
   getMyWarrantyForms,
   retryWarrantySync,
+  approveManualVerification,
+  rejectManualVerification,
+  uploadEquipmentPhoto,
+  streamEquipmentPhoto,
 } = require('../controllers/warrantyController');
 const { verifyToken, authorizeRole } = require('../middleware/auth');
+const { handleManualVerificationPhotoUpload } = require('../config/uploads');
 
 const router = express.Router();
 
@@ -70,7 +75,30 @@ const warrantyValidationRules = [
   // shape-only check here can't confirm the product actually exists.
   body('equipment').isArray({ min: 4, max: 4 }).withMessage('All 4 equipment types are required'),
   body('equipment.*.equipment_type').isIn(['REDUCER', 'CYLINDER', 'CONTROLLER', 'INJECTOR_RAIL']),
-  body('equipment.*.product_id').isInt().withMessage('A product must be selected for each equipment row'),
+  // product_id is optional here (not just for cylinder) so the same rule
+  // applies uniformly — resolveEquipment is the one place that actually
+  // enforces "required unless it's a typed cylinder" (CYLINDER_MODEL_REQUIRED
+  // otherwise), same pattern as the barcode-required check.
+  body('equipment.*.product_id').optional({ nullable: true }).isInt().withMessage('Product id must be an integer when provided'),
+  body('equipment.*.model').optional({ nullable: true }).trim().isLength({ max: 100 }).withMessage('Model must be 100 characters or fewer'),
+  body('equipment.*.brand_name').optional({ nullable: true }).trim().isLength({ max: 150 }).withMessage('Brand name must be 150 characters or fewer'),
+  // Manual Verification workflow — shape only here; "required when
+  // manual_verification is true" is a cross-field business rule enforced in
+  // warrantyService (inventoryService.validateBarcodeOrAcceptManual's
+  // SELLER_INFO_REQUIRED), the same layering CYLINDER_MODEL_REQUIRED already
+  // uses for the typed-cylinder path rather than in express-validator.
+  body('equipment.*.manual_verification').optional().isBoolean().withMessage('manual_verification must be a boolean'),
+  body('equipment.*.seller_name').optional({ nullable: true, checkFalsy: true }).trim().isLength({ max: 255 }).withMessage('Seller name must be 255 characters or fewer'),
+  body('equipment.*.seller_phone').optional({ nullable: true, checkFalsy: true }).trim().isLength({ max: 20 }).withMessage('Seller phone must be 20 characters or fewer'),
+  body('equipment.*.comment').optional({ nullable: true, checkFalsy: true }).trim().isLength({ max: 1000 }).withMessage('Comment must be 1000 characters or fewer'),
+  body('equipment.*.manual_verification_photo_filename').optional({ nullable: true, checkFalsy: true }).isLength({ max: 255 }).withMessage('Invalid photo reference'),
+];
+
+// Manual Verification workflow — admin review actions. notes optional on
+// both approve and reject, matching registrationRequestRoutes' own reject
+// validator exactly (not required even to reject).
+const manualVerificationReviewRules = [
+  body('notes').optional({ checkFalsy: true }).isLength({ max: 1000 }),
 ];
 
 router.post('/', verifyToken, warrantyValidationRules, createWarrantyForm);
@@ -88,5 +116,19 @@ router.delete('/:formId', verifyToken, authorizeRole('ADMIN'), deleteWarrantyFor
 
 // Manual retry for a warranty stuck in FAILED EasyGas sync status.
 router.post('/:formId/retry-sync', verifyToken, authorizeRole('ADMIN'), retryWarrantySync);
+
+// Manual Verification workflow — admin reviews one equipment row directly
+// (addressed by its own id, not by formId+type). ADMIN-only, same as every
+// other review/approval action in this app (registration requests, retry-sync).
+router.post('/equipment/:equipmentId/approve-verification', verifyToken, authorizeRole('ADMIN'), manualVerificationReviewRules, approveManualVerification);
+router.post('/equipment/:equipmentId/reject-verification', verifyToken, authorizeRole('ADMIN'), manualVerificationReviewRules, rejectManualVerification);
+
+// Pre-upload endpoint for a Manual Verification equipment photo — any
+// authenticated installer (uploaded mid-form-fill, before the warranty row
+// itself exists yet — see warrantyController.uploadEquipmentPhoto's doc
+// comment). The stream-back route is ADMIN-only, same split as registration
+// photos (uploaded broadly, viewed only by an admin).
+router.post('/equipment-photo', verifyToken, handleManualVerificationPhotoUpload, uploadEquipmentPhoto);
+router.get('/equipment/:equipmentId/photo', verifyToken, authorizeRole('ADMIN'), streamEquipmentPhoto);
 
 module.exports = router;

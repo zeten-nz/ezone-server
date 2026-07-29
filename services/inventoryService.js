@@ -1,6 +1,7 @@
 const inventoryRepository = require('../repositories/inventoryRepository');
 const inventoryImportBatchRepository = require('../repositories/inventoryImportBatchRepository');
 const inventoryAuditLogRepository = require('../repositories/inventoryAuditLogRepository');
+const manualVerificationUploadRepository = require('../repositories/manualVerificationUploadRepository');
 const AppError = require('../utils/AppError');
 const { EQUIPMENT_TYPE_TO_CATEGORIES } = require('../config/equipmentCategories');
 const { extractBarcodeCandidates } = require('../utils/csvBarcodeParser');
@@ -130,6 +131,74 @@ const validateBarcode = async (connection, { barcode, product, equipmentType }) 
     throw new AppError(`Barcode "${barcode}" is not available (current status: ${item.status})`, 409, 'BARCODE_NOT_AVAILABLE');
   }
   return item;
+};
+
+/**
+ * Manual Verification workflow — the one place that decides whether a
+ * BARCODE_NOT_FOUND failure may be replaced with seller info instead of
+ * blocking submission. Always calls validateBarcode first, exactly as the
+ * ordinary path does — this function never trusts the caller's claim that a
+ * barcode "wasn't found"; it independently re-derives the real failure
+ * reason every time, which is what makes this safe:
+ *
+ *   - Success                              -> AUTO, unchanged behavior.
+ *   - Any failure OTHER than BARCODE_NOT_FOUND (wrong product, wrong
+ *     category, inactive product, not available) -> re-thrown unchanged.
+ *     Manual verification must never paper over one of these — a client
+ *     setting manualVerificationRequested can never turn a
+ *     BARCODE_WRONG_PRODUCT/BARCODE_WRONG_CATEGORY/BARCODE_PRODUCT_INACTIVE/
+ *     BARCODE_NOT_AVAILABLE into a successful submission.
+ *   - BARCODE_NOT_FOUND and manualVerificationRequested is false -> re-thrown
+ *     unchanged (today's existing behavior: fix the barcode or fail).
+ *   - BARCODE_NOT_FOUND and manualVerificationRequested is true -> seller
+ *     info is validated (business rule, not shape — same layering
+ *     resolveEquipment already uses for CYLINDER_MODEL_REQUIRED) and a
+ *     PENDING resolution is returned instead of an item: no inventory_item_id,
+ *     nothing claimed, points withheld until an admin approves it (see
+ *     warrantyService.reviewManualVerification).
+ */
+const validateBarcodeOrAcceptManual = async (connection, { barcode, product, equipmentType, manualVerificationRequested, sellerName, sellerPhone, comment, photoFilename, uploadedBy }) => {
+  try {
+    const item = await validateBarcode(connection, { barcode, product, equipmentType });
+    return { verificationStatus: 'AUTO', inventoryItemId: item.id };
+  } catch (error) {
+    if (!(error instanceof AppError) || error.errorCode !== 'BARCODE_NOT_FOUND' || !manualVerificationRequested) {
+      throw error;
+    }
+    if (!sellerName || !String(sellerName).trim() || !sellerPhone || !String(sellerPhone).trim() || !comment || !String(comment).trim()) {
+      throw new AppError(`Seller name, seller phone, and a comment are required for manual verification of ${equipmentType}`, 400, 'SELLER_INFO_REQUIRED');
+    }
+    return {
+      verificationStatus: 'PENDING',
+      inventoryItemId: null,
+      sellerName: String(sellerName).trim(),
+      sellerPhone: String(sellerPhone).trim(),
+      comment: String(comment).trim(),
+      photoFilename: await resolveOwnedPhotoFilename(connection, photoFilename, uploadedBy),
+    };
+  }
+};
+
+/**
+ * Manual Verification workflow — never trusts a bare client-submitted
+ * filename string as a capability. A filename only gets attached if
+ * manualVerificationUploadRepository shows it was actually uploaded by
+ * `uploadedBy` (the same authenticated user performing THIS submission/edit)
+ * — otherwise it's silently dropped (treated as "no photo"), never a hard
+ * failure: a filename that doesn't check out is far more likely a stale/
+ * mismatched client state than a deliberate attack, and there's nothing
+ * useful about blocking the whole submission over just the photo. Called
+ * both from the barcode-(re)validation paths above and directly from
+ * warrantyService.updateWarrantyForm's unchanged-barcode branch, where no
+ * barcode re-validation happens but the photo can still be edited.
+ */
+const resolveOwnedPhotoFilename = async (connection, filename, uploadedBy) => {
+  if (!filename) return null;
+  const upload = await manualVerificationUploadRepository.findByFilename(connection, filename);
+  if (!upload || upload.uploaded_by !== uploadedBy) {
+    return null;
+  }
+  return filename;
 };
 
 /**
@@ -309,6 +378,8 @@ module.exports = {
   importCsv,
   isValidBarcode,
   validateBarcode,
+  validateBarcodeOrAcceptManual,
+  resolveOwnedPhotoFilename,
   claimForEquipmentRow,
   releaseForEquipmentRow,
   changeStatusManually,

@@ -2,8 +2,8 @@
  * IMAGE UPLOAD CONFIG
  *
  * Multer disk storage + a magic-byte content check for every file-upload
- * surface in this app (registration request photos, user profile photos).
- * Security notes:
+ * surface in this app (registration request photos, user profile photos,
+ * Manual Verification equipment photos). Security notes:
  *
  *   - Filenames are NEVER derived from client input. The on-disk name is
  *     always crypto.randomUUID() + an extension WE choose from the verified
@@ -18,7 +18,9 @@
  *
  *   - Registration photos are served back only through an authenticated,
  *     ADMIN-only route; profile photos only through an authenticated,
- *     self-only route (never express.static either way).
+ *     self-only route; Manual Verification photos only through an
+ *     authenticated, ADMIN-only route (see warrantyController.streamEquipmentPhoto)
+ *     — never express.static for any of the three.
  */
 
 const fs = require('fs');
@@ -28,8 +30,17 @@ const multer = require('multer');
 
 const REGISTRATION_UPLOAD_DIR = path.join(__dirname, '..', 'uploads', 'registration-photos');
 const PROFILE_UPLOAD_DIR = path.join(__dirname, '..', 'uploads', 'profile-photos');
+// Manual Verification workflow: a photo of the seller/product for an
+// equipment row whose barcode couldn't be validated. Uploaded independently
+// of the warranty JSON submission itself (see warrantyController.uploadEquipmentPhoto)
+// — the installer uploads it first and gets back a filename, which then
+// travels as a plain string field inside the ordinary warranty create/update
+// body, exactly like the other two upload flows below never require their
+// owning JSON endpoint to become multipart.
+const MANUAL_VERIFICATION_UPLOAD_DIR = path.join(__dirname, '..', 'uploads', 'manual-verification-photos');
 fs.mkdirSync(REGISTRATION_UPLOAD_DIR, { recursive: true });
 fs.mkdirSync(PROFILE_UPLOAD_DIR, { recursive: true });
+fs.mkdirSync(MANUAL_VERIFICATION_UPLOAD_DIR, { recursive: true });
 
 const MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024; // 5 MB
 
@@ -66,6 +77,7 @@ function createUpload(destinationDir) {
 
 const registrationUpload = createUpload(REGISTRATION_UPLOAD_DIR);
 const profileUpload = createUpload(PROFILE_UPLOAD_DIR);
+const manualVerificationUpload = createUpload(MANUAL_VERIFICATION_UPLOAD_DIR);
 
 /**
  * Reads the first bytes of a written file and checks them against known
@@ -124,12 +136,15 @@ function wrapSingleUpload(uploadInstance) {
 
 const handleRegistrationPhotoUpload = wrapSingleUpload(registrationUpload);
 const handleProfilePhotoUpload = wrapSingleUpload(profileUpload);
+const handleManualVerificationPhotoUpload = wrapSingleUpload(manualVerificationUpload);
 
 module.exports = {
   UPLOAD_DIR: REGISTRATION_UPLOAD_DIR,
   PROFILE_UPLOAD_DIR,
+  MANUAL_VERIFICATION_UPLOAD_DIR,
   MAX_FILE_SIZE_BYTES,
   handleRegistrationPhotoUpload,
   handleProfilePhotoUpload,
+  handleManualVerificationPhotoUpload,
   verifyImageMagicBytes,
 };

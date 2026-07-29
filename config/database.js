@@ -83,6 +83,34 @@ async function ensureColumn(connection, table, column, definition) {
  * rows. MODIFY COLUMN never loses existing data; this only ever widens the
  * constraint, and only does so once (checked via information_schema first).
  */
+/**
+ * Repairs a column whose collation drifted from this schema's standard
+ * (utf8mb4_unicode_ci, set explicitly on every original CREATE TABLE) to
+ * MySQL 8's own default (utf8mb4_0900_ai_ci) — which happens whenever a
+ * column is added via ensureColumn/ensureNullableColumn's ALTER without an
+ * explicit COLLATE clause. Harmless until two differently-collated VARCHAR
+ * columns are compared directly (a JOIN or WHERE ... = another column,
+ * never a bound `?` parameter), which throws "Illegal mix of collations"
+ * and fails outright — confirmed the hard way by warranty_forms.
+ * installer_branch_code vs branches.code (see cleanupAccidentalAdminBranches
+ * and easyGasSyncService.js's syncWarranty, which joins the same two
+ * columns and had never actually been exercised against a real PENDING row
+ * yet). `definition` must repeat the column's full, unchanged type/
+ * nullability/default — MODIFY COLUMN replaces the whole definition, not
+ * just the collation.
+ */
+async function ensureColumnCollation(connection, table, column, definition) {
+  const [rows] = await connection.execute(
+    `SELECT COLLATION_NAME FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?`,
+    [table, column]
+  );
+  if (rows.length > 0 && rows[0].COLLATION_NAME && rows[0].COLLATION_NAME !== 'utf8mb4_unicode_ci') {
+    await connection.execute(`ALTER TABLE ${table} MODIFY COLUMN ${definition}`);
+    console.log(`[DB] Migration: fixed ${table}.${column} collation (was ${rows[0].COLLATION_NAME})`);
+  }
+}
+
 async function ensureNullableColumn(connection, table, column, definition) {
   const [rows] = await connection.execute(
     `SELECT IS_NULLABLE FROM information_schema.COLUMNS
@@ -243,12 +271,22 @@ async function backfillBranches(connection) {
     return inserted.insertId;
   };
 
+  // role != 'ADMIN': an admin account has no physical branch — a
+  // branch_code on one is never real historical data worth promoting, only
+  // ever a placeholder (see mockData.js). Without this exclusion, an admin
+  // seed's placeholder value gets treated identically to a real employee's
+  // branch code and silently becomes a permanent, real branches row (see
+  // cleanupAccidentalAdminBranches below for the one-time repair of a
+  // database that already has this from before this fix).
   const [userCodes] = await connection.execute(
-    `SELECT DISTINCT branch_code FROM users WHERE branch_code IS NOT NULL AND branch_code <> '' AND branch_id IS NULL`
+    `SELECT DISTINCT branch_code FROM users WHERE branch_code IS NOT NULL AND branch_code <> '' AND branch_id IS NULL AND role != 'ADMIN'`
   );
   for (const { branch_code } of userCodes) {
     const branchId = await findOrCreateBranch(branch_code, true);
-    await connection.execute('UPDATE users SET branch_id = ? WHERE branch_code = ? AND branch_id IS NULL', [branchId, branch_code]);
+    await connection.execute(
+      `UPDATE users SET branch_id = ? WHERE branch_code = ? AND branch_id IS NULL AND role != 'ADMIN'`,
+      [branchId, branch_code]
+    );
   }
 
   const [requestCodes] = await connection.execute(
@@ -257,6 +295,36 @@ async function backfillBranches(connection) {
   for (const { branch_code } of requestCodes) {
     const branchId = await findOrCreateBranch(branch_code, false);
     await connection.execute('UPDATE registration_requests SET branch_id = ? WHERE branch_code = ? AND branch_id IS NULL', [branchId, branch_code]);
+  }
+}
+
+/**
+ * One-time repair for a database that already has the bug backfillBranches
+ * used to have: an admin account's placeholder branch_code got promoted
+ * into a real branches row before the role != 'ADMIN' exclusion above
+ * existed. Deliberately not keyed on the literal string 'ADMIN' — it
+ * generically detects "a branch that exists only because an admin account
+ * points to it," which is the actual failure mode, regardless of what
+ * placeholder string produced it. Conservative by construction: only acts
+ * when every dependency check below comes back clean, so it can never
+ * delete a real branch.
+ */
+async function cleanupAccidentalAdminBranches(connection) {
+  const [candidates] = await connection.execute(`
+    SELECT b.id, b.code
+    FROM branches b
+    WHERE EXISTS (SELECT 1 FROM users u WHERE u.branch_id = b.id AND u.role = 'ADMIN')
+      AND NOT EXISTS (SELECT 1 FROM users u WHERE u.branch_id = b.id AND u.role != 'ADMIN')
+      AND NOT EXISTS (SELECT 1 FROM inventory_items ii WHERE ii.branch_id = b.id)
+      AND NOT EXISTS (SELECT 1 FROM warranty_forms wf WHERE wf.installer_branch_code = b.code)
+  `);
+  for (const branch of candidates) {
+    // Clear the referencing column first — users.branch_id -> branches.id
+    // has no ON DELETE override (defaults to RESTRICT), so the DELETE below
+    // would otherwise fail with a foreign-key violation.
+    await connection.execute(`UPDATE users SET branch_id = NULL, branch_code = NULL WHERE branch_id = ? AND role = 'ADMIN'`, [branch.id]);
+    await connection.execute(`DELETE FROM branches WHERE id = ?`, [branch.id]);
+    console.log(`[DB] Migration: removed accidental admin-only branch '${branch.code}' (id=${branch.id})`);
   }
 }
 
@@ -752,6 +820,24 @@ const initializeDatabase = async (loadMockData = false) => {
       'car_id INT NULL AFTER vehicle_name, ADD CONSTRAINT fk_warranty_forms_car FOREIGN KEY (car_id) REFERENCES cars(id)'
     );
 
+    // branches.easygas_stag_code: the real EasyGas STAG-format branch code
+    // (e.g. "01/1") needed for buildPayload's branch_stag_code field (see
+    // easyGasSyncService.js) — genuinely distinct from branches.code (this
+    // app's own internal identifier, e.g. "BR001"). Nullable and left
+    // unpopulated by any code path here: no /branches sync is wired to
+    // auto-populate it (see easyGasCatalogClient.getBranches) — it's a
+    // manual, ops-entered value per branch, filled in outside this codebase.
+    await ensureColumn(connection, 'branches', 'easygas_stag_code', 'easygas_stag_code VARCHAR(20) NULL AFTER code');
+
+    // cars.is_active: mirrors products.is_active's existing pattern —
+    // EasyGas's catalog has no soft-deletes, so a deleted car can only be
+    // noticed by a full-catalog sync finding it missing (see
+    // easyGasCatalogSyncService.js's syncCars). Never hard-delete a car row:
+    // warranty_forms.car_id has a real FK to it, and a historical warranty
+    // must keep resolving correctly even after the car leaves EasyGas's
+    // active catalog.
+    await ensureColumn(connection, 'cars', 'is_active', 'is_active BOOLEAN NOT NULL DEFAULT TRUE AFTER model');
+
     // ── Inventory module (Phase 1) ───────────────────────────────────────────
     // Physical-unit tracking on top of the EasyGas-synced products catalog.
     // products stays sync-only (see products-architecture memory) — these
@@ -889,6 +975,44 @@ const initializeDatabase = async (loadMockData = false) => {
     await ensureForeignKeyRestrict(connection, 'product_point_configs', 'product_id', 'products');
     await ensureForeignKeyRestrict(connection, 'product_point_config_history', 'product_id', 'products');
 
+    // Point value for a TYPED equipment slot — currently only ever meaningful
+    // for CYLINDER, the one equipment type that can be submitted with no
+    // product_id at all (a free-text brand/capacity instead of a catalog
+    // pick — see the typed-cylinder work in warrantyService.js). Without
+    // this, a typed cylinder always earns 0 points (product_point_configs is
+    // keyed by product_id, which a typed cylinder never has), which
+    // incentivizes an installer to falsely pick a catalog product instead of
+    // accurately reporting an off-catalog one — flagged by EasyGas, since a
+    // wrong product recorded here also corrupts their own fuel cross-check.
+    // Keyed by equipment_type (not a sentinel product_id) so it can never be
+    // confused with a real product's config. The other 3 enum values will
+    // realistically never have a row — kept in the ENUM only for consistency
+    // with every other equipment_type column in this schema.
+    await connection.execute(`
+      CREATE TABLE IF NOT EXISTS equipment_type_point_configs (
+        equipment_type ENUM('REDUCER', 'CYLINDER', 'CONTROLLER', 'INJECTOR_RAIL') PRIMARY KEY,
+        points         INT NOT NULL DEFAULT 0,
+        updated_by     INT NULL,
+        updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (updated_by) REFERENCES users(id)
+      ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+    `);
+
+    // Audit trail for the config VALUE itself, mirroring
+    // product_point_config_history's exact reasoning.
+    await connection.execute(`
+      CREATE TABLE IF NOT EXISTS equipment_type_point_config_history (
+        id             INT PRIMARY KEY AUTO_INCREMENT,
+        equipment_type ENUM('REDUCER', 'CYLINDER', 'CONTROLLER', 'INJECTOR_RAIL') NOT NULL,
+        old_points     INT NULL,
+        new_points     INT NOT NULL,
+        changed_by     INT NOT NULL,
+        created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (changed_by) REFERENCES users(id)
+      ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+    `);
+
     // The installer points ledger — append-only, never UPDATEd or DELETEd by
     // any code path. warranty_form_id/warranty_equipment_id are ON DELETE SET
     // NULL, not CASCADE: deleting a warranty must never delete its point
@@ -987,6 +1111,93 @@ const initializeDatabase = async (loadMockData = false) => {
     await ensureIndexAdded(connection, 'warranty_forms', 'idx_warranty_forms_installation_date', '(installation_date)');
     await ensureIndexAdded(connection, 'point_transactions', 'idx_point_transactions_created_at', '(created_at)');
 
+    // ── Typed cylinder support (EasyGas open cylinder input) ────────────────
+    // EasyGas's catalog only carries 2 CNG cylinder models — not enough for
+    // what installers actually fit — so a cylinder may now be entered as
+    // free text (brand_name + model/capacity) instead of a catalog
+    // product_id. The other 3 equipment types are unaffected and still
+    // always require one.
+    await ensureNullableColumn(connection, 'warranty_equipment', 'product_id', 'product_id INT NULL');
+    await ensureColumn(connection, 'warranty_equipment', 'brand_name', 'brand_name VARCHAR(150) NULL AFTER serial_number');
+    await ensureColumn(connection, 'warranty_equipment', 'model', 'model VARCHAR(100) NULL AFTER brand_name');
+
+    // ── Manual Verification workflow ─────────────────────────────────────────
+    // Some installers receive genuine STAG products whose barcode sticker is
+    // damaged, unreadable, was never imported, or belongs to old stock that
+    // predates this app's inventory tracking entirely — none of that means
+    // the installation is fraudulent, so rejecting the warranty outright (the
+    // only option before this) is the wrong call. An equipment row whose
+    // barcode genuinely resolves to BARCODE_NOT_FOUND (never any other
+    // validateBarcode failure — see inventoryService.validateBarcodeOrAcceptManual)
+    // may instead be submitted with seller info in place of a claimed
+    // inventory item, pending admin review.
+    //
+    // Lives on warranty_equipment, not warranty_forms: the problem is almost
+    // always one damaged sticker out of four, not the whole installation, and
+    // every downstream effect this touches (points, inventory claims) is
+    // already tracked per equipment row, never per warranty.
+    //
+    // verification_status alone captures both "how was this row identified"
+    // and "what's its current review state" — AUTO means the ordinary barcode
+    // path (every historical row, and the default for every new one), so no
+    // row can ever be both AUTO and pending review; a second "method" column
+    // would be redundant. Deliberately NOT reusing the existing dormant
+    // equipment_validation_status column above — that one is reserved for a
+    // different, future, external STAG validation API integration, and
+    // sharing it here would collide with that the moment it ships.
+    await ensureColumn(connection, 'warranty_equipment', 'verification_status', 'verification_status ENUM(\'AUTO\', \'PENDING\', \'APPROVED\', \'REJECTED\') NOT NULL DEFAULT \'AUTO\' AFTER model');
+    await ensureColumn(connection, 'warranty_equipment', 'seller_name', 'seller_name VARCHAR(255) NULL AFTER verification_status');
+    await ensureColumn(connection, 'warranty_equipment', 'seller_phone', 'seller_phone VARCHAR(20) NULL AFTER seller_name');
+    // Named verification_comment, not `comment` — COMMENT is a reserved word
+    // in MySQL's own column/table-definition syntax. The API/JS field name
+    // is `comment` (see warranty.service.js's toWirePayload and
+    // warrantyRoutes.js's validator) — this column is where it's persisted;
+    // the two names refer to the exact same value, just DB vs wire naming,
+    // never renamed to keep both call sites' existing contracts unchanged.
+    // Not to be confused with review_notes below, a completely different
+    // field: this one is the INSTALLER's explanation submitted with the
+    // claim; review_notes is the ADMIN's own note recorded at approve/reject
+    // time — two different authors, two different points in the workflow.
+    await ensureColumn(connection, 'warranty_equipment', 'verification_comment', 'verification_comment VARCHAR(1000) NULL AFTER seller_phone');
+    await ensureColumn(connection, 'warranty_equipment', 'manual_verification_photo_filename', 'manual_verification_photo_filename VARCHAR(255) NULL AFTER verification_comment');
+    // reviewed_by/reviewed_at/review_notes mirror registration_requests'
+    // own review columns exactly — same shape, same reasoning: one row, one
+    // review, no separate log table needed for a single reviewer decision.
+    // review_notes is the admin's own note — see verification_comment above
+    // for how it differs from the installer's submitted comment.
+    await ensureColumn(
+      connection, 'warranty_equipment', 'reviewed_by',
+      'reviewed_by INT NULL AFTER manual_verification_photo_filename, ADD CONSTRAINT fk_warranty_equipment_reviewed_by FOREIGN KEY (reviewed_by) REFERENCES users(id)'
+    );
+    await ensureColumn(connection, 'warranty_equipment', 'reviewed_at', 'reviewed_at TIMESTAMP NULL DEFAULT NULL AFTER reviewed_by');
+    await ensureColumn(connection, 'warranty_equipment', 'review_notes', 'review_notes VARCHAR(1000) NULL AFTER reviewed_at');
+
+    // Admin "pending manual verification" list/filter — same reporting-index
+    // convention as idx_warranty_forms_sync_status below.
+    await ensureIndexAdded(connection, 'warranty_equipment', 'idx_warranty_equipment_verification_status', '(verification_status)');
+
+    // Manual Verification workflow — photo upload ownership tracking (review
+    // fix: a bare client-submitted filename string must never be trusted on
+    // its own; only a filename this exact user actually uploaded may be
+    // attached to their submission — see inventoryService.resolveOwnedPhotoFilename).
+    // Also doubles as the source of truth for orphaned-upload cleanup
+    // (services/manualVerificationUploadCleanupSweep.js): a row here with no
+    // matching warranty_equipment.manual_verification_photo_filename after a
+    // grace period was uploaded but never actually used in a submission.
+    // Deliberately NOT a FK to warranty_equipment (an upload may never end up
+    // attached to anything, or may be superseded by a later re-upload before
+    // the warranty is even saved) — the relationship is discovered by
+    // matching filenames at read time, not stored as a foreign key.
+    await connection.execute(`
+      CREATE TABLE IF NOT EXISTS manual_verification_photo_uploads (
+        id          INT PRIMARY KEY AUTO_INCREMENT,
+        filename    VARCHAR(255) NOT NULL UNIQUE,
+        uploaded_by INT NOT NULL,
+        created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (uploaded_by) REFERENCES users(id)
+      ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+    `);
+
     // Only seed mock data when the database is completely empty AND the
     // LOAD_MOCK_DATA env var hasn't been set to 'false'.
     // This prevents accidental data loss in production if someone restarts
@@ -1006,7 +1217,12 @@ const initializeDatabase = async (loadMockData = false) => {
     // Runs after mock-data seeding (if any) so it always sees the final set
     // of branch_code values, whether real historical data or freshly-seeded
     // dev data — see backfillBranches/seedPlaceholderBranches above.
+    // Must run before cleanupAccidentalAdminBranches (and before the EasyGas
+    // sync sweep's own branches.code join ever fires) — see
+    // ensureColumnCollation's header comment for the real incident this fixes.
+    await ensureColumnCollation(connection, 'warranty_forms', 'installer_branch_code', 'installer_branch_code VARCHAR(100) NULL COLLATE utf8mb4_unicode_ci');
     await backfillBranches(connection);
+    await cleanupAccidentalAdminBranches(connection);
     await seedPlaceholderBranches(connection);
     await migrateWarrantyFormProducts(connection);
     await backfillWarrantyFuelType(connection);

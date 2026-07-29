@@ -1,10 +1,12 @@
 const express = require('express');
-const { body } = require('express-validator');
+const { body, param } = require('express-validator');
 const {
   getMyPoints,
   getInstallerPoints,
   getProductConfigs,
   setProductConfig,
+  getEquipmentTypeConfigs,
+  setEquipmentTypeConfig,
   createAdjustment,
 } = require('../controllers/pointsController');
 const { verifyToken, authorizeRole, requireSuperAdmin } = require('../middleware/auth');
@@ -21,6 +23,7 @@ router.use(authorizeRole('ADMIN'));
 
 router.get('/installer/:installerId', getInstallerPoints);
 router.get('/configs', getProductConfigs);
+router.get('/equipment-configs', getEquipmentTypeConfigs);
 
 // Super Admin only — configuring point values and creating manual
 // adjustments are strictly more privileged than ordinary Admin capability
@@ -28,6 +31,11 @@ router.get('/configs', getProductConfigs);
 router.put('/configs/:productId', requireSuperAdmin, [
   body('points').isInt({ min: 0 }).withMessage('Points must be a non-negative integer'),
 ], setProductConfig);
+
+router.put('/equipment-configs/:equipmentType', requireSuperAdmin, [
+  param('equipmentType').isIn(['REDUCER', 'CYLINDER', 'CONTROLLER', 'INJECTOR_RAIL']).withMessage('Invalid equipment type'),
+  body('points').isInt({ min: 0 }).withMessage('Points must be a non-negative integer'),
+], setEquipmentTypeConfig);
 
 router.post('/adjustments', requireSuperAdmin, [
   body('installerId').isInt().withMessage('installerId is required'),

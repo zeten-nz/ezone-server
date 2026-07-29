@@ -360,12 +360,16 @@ const getProductStatistics = async (connection, productId) => {
      FROM inventory_items WHERE product_id = ? AND status != 'MERGED'`,
     [productId]
   );
+  // Manual Verification: excludes PENDING/REJECTED rows — a top-installers/
+  // top-branches ranking "for this product" should reflect confirmed
+  // installations (AUTO or admin-APPROVED), same reasoning as
+  // reportsController.getProductsInstalled.
   const [topInstallers] = await connection.execute(
     `SELECT u.id, u.full_name, COUNT(*) AS count
      FROM warranty_equipment we
      JOIN warranty_forms wf ON wf.id = we.warranty_form_id
      JOIN users u ON u.id = wf.employee_id
-     WHERE we.product_id = ?
+     WHERE we.product_id = ? AND we.verification_status NOT IN ('PENDING', 'REJECTED')
      GROUP BY u.id, u.full_name
      ORDER BY count DESC LIMIT 10`,
     [productId]
@@ -376,7 +380,7 @@ const getProductStatistics = async (connection, productId) => {
      JOIN warranty_forms wf ON wf.id = we.warranty_form_id
      JOIN users u ON u.id = wf.employee_id
      JOIN branches b ON b.id = u.branch_id
-     WHERE we.product_id = ?
+     WHERE we.product_id = ? AND we.verification_status NOT IN ('PENDING', 'REJECTED')
      GROUP BY b.id, b.name
      ORDER BY count DESC LIMIT 10`,
     [productId]

@@ -112,15 +112,20 @@ const getMonthlyActivity = async (req, res, next) => {
 };
 
 /** Counts grouped by category/brand, sourced from warranty_equipment (the
- * fixed 4-slot model) — every row here is by definition an installation, so
- * there's no status filter needed (unlike the old serialized-inventory
- * model's 'INSTALLED' check). */
+ * fixed 4-slot model) — every row here used to be an installation by
+ * definition (unlike the old serialized-inventory model's 'INSTALLED'
+ * check), but Manual Verification introduced two exceptions: a PENDING row
+ * is not yet a confirmed installation, and a REJECTED row is a deliberate
+ * "this wasn't a real/verified installation" decision — both excluded here
+ * so this count reflects confirmed installations only, same as it always
+ * intended to. AUTO (the ordinary barcode path) and APPROVED (an
+ * admin-confirmed Manual Verification claim) both still count normally. */
 const getProductsInstalled = async (req, res, next) => {
   try {
     const { category } = req.query;
     const connection = await pool.getConnection();
 
-    const conditions = ['1 = 1'];
+    const conditions = [`we.verification_status NOT IN ('PENDING', 'REJECTED')`];
     const params = [];
     if (category) {
       conditions.push('p.category = ?');
@@ -344,12 +349,16 @@ const getInstallerStatisticsData = async (connection, installerId) => {
      WHERE wf.employee_id = ? AND we.inventory_item_id IS NOT NULL`,
     [installerId]
   );
+  // Manual Verification: excludes PENDING (not yet confirmed) and REJECTED
+  // (explicitly not a verified installation) rows, same reasoning as
+  // reportsController.getProductsInstalled — an installer's "top products"
+  // should reflect confirmed installations, not unresolved or rejected claims.
   const [topProducts] = await connection.execute(
     `SELECT p.id, p.brand, p.model, COUNT(*) AS count
      FROM warranty_equipment we
      JOIN warranty_forms wf ON wf.id = we.warranty_form_id
      JOIN products p ON p.id = we.product_id
-     WHERE wf.employee_id = ?
+     WHERE wf.employee_id = ? AND we.verification_status NOT IN ('PENDING', 'REJECTED')
      GROUP BY p.id, p.brand, p.model
      ORDER BY count DESC LIMIT 10`,
     [installerId]

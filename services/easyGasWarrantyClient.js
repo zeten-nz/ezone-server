@@ -1,23 +1,11 @@
-const crypto = require('crypto');
+const { buildSignedHeaders } = require('../utils/easyGasSigning');
 
-// EasyGas's private, HMAC-signed warranty-submission API — a completely
-// separate API from their public product catalog (see easyGasCatalogClient.js).
-// Confirmed distinct base URLs; never share one BASE_URL between the two again.
+// EasyGas's private, HMAC-signed warranty-submission API. The catalog API
+// (see easyGasCatalogClient.js) now shares this same signed base URL/secret
+// per EasyGas's request — both clients sign via utils/easyGasSigning.js.
 const BASE_URL = process.env.EASYGAS_WARRANTY_API_BASE_URL;
 const SHARED_SECRET = process.env.EASYGAS_SHARED_SECRET;
 const REQUEST_TIMEOUT_MS = 3000;
-
-/**
- * Signs the EXACT bytes about to be transmitted — `rawBody` must be the same
- * string used as the actual request body, never a second independent
- * `JSON.stringify` call (which could theoretically differ in key order).
- * GET requests sign an empty body: `${timestamp}.`.
- */
-const sign = (timestamp, rawBody) => {
-  const payload = `${timestamp}.${rawBody}`;
-  const hmac = crypto.createHmac('sha256', SHARED_SECRET).update(payload).digest('hex');
-  return `sha256=${hmac}`;
-};
 
 /**
  * Pure HTTP client for EasyGas's private warranty-submission API — never
@@ -40,16 +28,14 @@ const request = async (method, path, body) => {
   // returned promise, silently breaking the "never rejects" contract this
   // whole client exists to provide.
   try {
-    const timestamp = Math.floor(Date.now() / 1000);
     const rawBody = body ? JSON.stringify(body) : '';
-    const signature = sign(timestamp, rawBody);
+    const signedHeaders = buildSignedHeaders(SHARED_SECRET, rawBody);
 
     const response = await fetch(`${BASE_URL}${path}`, {
       method,
       headers: {
         'Content-Type': 'application/json',
-        'X-EG-Timestamp': String(timestamp),
-        'X-EG-Signature': signature,
+        ...signedHeaders,
       },
       body: method === 'GET' ? undefined : rawBody,
       signal: controller.signal,
@@ -64,6 +50,6 @@ const request = async (method, path, body) => {
   }
 };
 
-const submitWarranty = (payload) => request('POST', '/', payload);
+const submitWarranty = (payload) => request('POST', '', payload);
 
 module.exports = { submitWarranty };

@@ -71,11 +71,15 @@ const generateMockData = async (connection) => {
   try {
     const adminPassword = await bcrypt.hash('admin123', 10);
 
-    // Create admin
+    // Create admin. branch_code is deliberately NULL, not a placeholder
+    // string — an admin account has no physical branch, and a placeholder
+    // like 'ADMIN' here used to get silently promoted into a real branches
+    // row by backfillBranches (see config/database.js's
+    // cleanupAccidentalAdminBranches for the fix + cleanup of that bug).
     await connection.execute(
       `INSERT INTO users (full_name, username, password, phone, branch_code, role, is_active)
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      ['System Administrator', 'admin', adminPassword, '+998901234567', 'ADMIN', 'ADMIN', true]
+      ['System Administrator', 'admin', adminPassword, '+998901234567', null, 'ADMIN', true]
     );
 
     // Seed the product catalog once, capturing each row's id/brand/model so

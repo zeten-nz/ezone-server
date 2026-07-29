@@ -79,3 +79,7 @@ fi
 
 log "Update complete. Current PM2 status:"
 sudo -u "$APP_USER" pm2 status
+
+
+
+   RAIL IG7 Dakota 4 sil.  Mavjud test 7/21/2026     KME NEVO-SKY Direct 4 Model 2  Mavjud test 7/21/2026     STAKO 50L  Mavjud test 7/21/2026     ADAX AR01

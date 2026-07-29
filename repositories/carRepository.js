@@ -10,7 +10,7 @@ const search = async (connection, { query, limit = 20 }) => {
   const safeLimit = Math.min(50, Math.max(1, parseInt(limit, 10) || 20));
   const [rows] = await connection.execute(
     `SELECT id, brand, model FROM cars
-     WHERE (brand LIKE ? OR model LIKE ?)
+     WHERE is_active = TRUE AND (brand LIKE ? OR model LIKE ?)
      ORDER BY brand ASC, model ASC
      LIMIT ${safeLimit}`,
     [`%${query}%`, `%${query}%`]

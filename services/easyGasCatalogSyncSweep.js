@@ -42,7 +42,22 @@ const runCatalogSyncCycle = async (pool) => {
   }
 };
 
+// PM2 cluster mode sets NODE_APP_INSTANCE to '0', '1', '2', ... per worker,
+// stable for the cluster's lifetime. Undefined outside cluster mode (local
+// dev, fork mode) — always treated as "run" there, since there's only one
+// process anyway. Gating to worker '0' only is what stops every cluster
+// worker from independently re-pulling the entire EasyGas catalog on the
+// same interval (this sweep has no per-row claim, unlike the warranty
+// sweep's atomic PENDING->SYNCING claim, since a plain catalog upsert has
+// no per-row race to guard against — see the file header comment above).
+const NODE_APP_INSTANCE = process.env.NODE_APP_INSTANCE;
+const isPrimaryWorker = NODE_APP_INSTANCE === undefined || NODE_APP_INSTANCE === '0';
+
 const startEasyGasCatalogSyncSweep = (pool) => {
+  if (!isPrimaryWorker) {
+    console.log(`[EasyGas Catalog Sync] Worker ${NODE_APP_INSTANCE} skipping — only worker 0 runs the catalog sync sweep`);
+    return;
+  }
   setInterval(() => {
     runCatalogSyncCycle(pool).catch((error) => {
       console.error('[EasyGas Catalog Sync] Cycle failed:', error.message);

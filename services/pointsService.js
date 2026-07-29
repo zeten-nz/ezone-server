@@ -1,6 +1,7 @@
 const AppError = require('../utils/AppError');
 const pointTransactionRepository = require('../repositories/pointTransactionRepository');
 const productPointConfigRepository = require('../repositories/productPointConfigRepository');
+const equipmentTypePointConfigRepository = require('../repositories/equipmentTypePointConfigRepository');
 
 const MANUAL_TYPES = ['MANUAL_ADJUSTMENT', 'MANUAL_BONUS', 'MANUAL_PENALTY'];
 
@@ -15,7 +16,15 @@ const MANUAL_TYPES = ['MANUAL_ADJUSTMENT', 'MANUAL_BONUS', 'MANUAL_PENALTY'];
  * something happened, not record a no-op.
  */
 const awardForEquipmentRow = async (connection, { installerId, warrantyFormId, warrantyEquipmentId, productId, equipmentType, productLabel, createdBy }) => {
-  const points = await productPointConfigRepository.getPoints(connection, productId);
+  // A typed cylinder (see warrantyService.resolveEquipment) has no product_id
+  // at all — product_point_configs is keyed by product_id, so that lookup
+  // can never find it. Fall back to a value keyed by equipment_type instead,
+  // so an installer who accurately reports an off-catalog cylinder isn't
+  // stuck earning 0 by construction (see equipmentTypePointConfigRepository's
+  // header comment for why this matters beyond just fairness to the installer).
+  const points = productId
+    ? await productPointConfigRepository.getPoints(connection, productId)
+    : await equipmentTypePointConfigRepository.getPoints(connection, equipmentType);
   if (points === 0) return null;
 
   const reason = `Warranty #${warrantyFormId} — ${equipmentType}${productLabel ? ` — ${productLabel}` : ''}`;
@@ -127,6 +136,23 @@ const setProductConfig = async (connection, { productId, points, updatedBy }) =>
   await productPointConfigRepository.upsert(connection, { productId, points, updatedBy });
 };
 
+const listEquipmentTypeConfigs = (connection) => equipmentTypePointConfigRepository.listAll(connection);
+
+const setEquipmentTypeConfig = async (connection, { equipmentType, points, updatedBy }) => {
+  if (!equipmentTypePointConfigRepository.CONFIGURABLE_TYPES.includes(equipmentType)) {
+    // Not a hardening measure against a malicious caller (the route already
+    // validates equipmentType against the full ENUM) — this guards against a
+    // confusing no-op: setting a value for REDUCER/CONTROLLER/INJECTOR_RAIL
+    // would "succeed" but can never be read back, since none of those types
+    // can currently be submitted without a real product_id.
+    throw new AppError(`${equipmentType} can never be typed — only CYLINDER has a configurable point value`, 400, 'EQUIPMENT_TYPE_NOT_CONFIGURABLE');
+  }
+  if (!Number.isInteger(points) || points < 0) {
+    throw new AppError('Points must be a non-negative integer', 400, 'VALIDATION_ERROR');
+  }
+  await equipmentTypePointConfigRepository.upsert(connection, { equipmentType, points, updatedBy });
+};
+
 module.exports = {
   awardForEquipmentRow,
   reverseForEquipmentRow,
@@ -134,4 +160,6 @@ module.exports = {
   getInstallerLedger,
   listProductConfigs,
   setProductConfig,
+  listEquipmentTypeConfigs,
+  setEquipmentTypeConfig,
 };

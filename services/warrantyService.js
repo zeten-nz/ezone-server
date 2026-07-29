@@ -19,6 +19,11 @@ const getEmployeeSnapshot = (connection, employeeId) => warrantyRepository.getEm
  * the DB's UNIQUE(warranty_form_id, equipment_type) constraint guards
  * against duplicates but can't by itself guarantee completeness.
  *
+ * Exception: a CYLINDER row with no product_id is a typed cylinder (free-
+ * text brand+model instead of a catalog pick — see the isTypedCylinder
+ * branch below) and skips the catalog lookup/barcode/inventory entirely.
+ * The other 3 equipment types always go through the catalog path.
+ *
  * validateBarcodes (Phase 2) controls whether each row's barcode
  * (serial_number IS the barcode — see the Phase 2 plan's Design Decision 2,
  * they're the same value, not two fields) is also validated against real
@@ -39,8 +44,14 @@ const getEmployeeSnapshot = (connection, employeeId) => warrantyRepository.getEm
  * When validateBarcodes is true, each resolved row's `inventory_item_id` is
  * already populated (from the item validateBarcode found) — update fills
  * this in separately, per row, once it knows which rows actually changed.
+ *
+ * actingUserId: only meaningful when validateBarcodes is true (create) — the
+ * submitting employee, needed to verify a Manual Verification photo upload
+ * actually belongs to them (see inventoryService.resolveOwnedPhotoFilename).
+ * Unused in update mode, where photo ownership is instead checked directly
+ * inside updateWarrantyForm's own per-row loop once it knows which rows changed.
  */
-const resolveEquipment = async (connection, equipmentInput, { validateBarcodes } = { validateBarcodes: true }) => {
+const resolveEquipment = async (connection, equipmentInput, { validateBarcodes, actingUserId } = { validateBarcodes: true }) => {
   const rows = Array.isArray(equipmentInput) ? equipmentInput : [];
   const types = rows.map((r) => r.equipment_type);
   const uniqueTypes = new Set(types);
@@ -53,6 +64,45 @@ const resolveEquipment = async (connection, equipmentInput, { validateBarcodes }
 
   const resolved = [];
   for (const row of rows) {
+    // Typed cylinder: EasyGas's catalog only carries 2 CNG cylinder models —
+    // not enough for what installers actually fit — so a cylinder may be
+    // entered as free-text brand+capacity instead of a catalog product_id.
+    // No product, no barcode, no inventory claim, and 0 points (there's no
+    // product to look up a point value for — productPointConfigRepository.
+    // getPoints safely returns 0 for a null productId, no special-casing
+    // needed). The other 3 equipment types are unaffected and always
+    // require a real catalog product_id.
+    const isTypedCylinder = row.equipment_type === 'CYLINDER' && !row.product_id;
+    if (isTypedCylinder) {
+      if (!row.model || !String(row.model).trim()) {
+        throw new AppError('A model/capacity is required for a typed cylinder', 400, 'CYLINDER_MODEL_REQUIRED');
+      }
+      const brandName = row.brand_name ? String(row.brand_name).trim() : null;
+      const model = String(row.model).trim();
+      resolved.push({
+        equipment_type: 'CYLINDER',
+        product_id: null,
+        product_name: brandName ? `${brandName} ${model}` : model,
+        brand_name: brandName,
+        model,
+        serial_number: row.serial_number || null,
+        inventory_item_id: null,
+        // A typed cylinder has no catalog product and no barcode at all —
+        // an entirely different, pre-existing bypass from Manual
+        // Verification (see the isTypedCylinder branch above, checked and
+        // `continue`d before this point is ever reached). AUTO here simply
+        // means "nothing pending review," so it never blocks points or
+        // EasyGas sync — unchanged from how a typed cylinder already behaved
+        // before this feature existed.
+        verification_status: 'AUTO',
+        seller_name: null,
+        seller_phone: null,
+        verification_comment: null,
+        manual_verification_photo_filename: null,
+      });
+      continue;
+    }
+
     const product = await productRepository.findById(connection, row.product_id);
     if (!product) {
       throw new AppError(`Product not found for ${row.equipment_type}`, 404, 'PRODUCT_NOT_FOUND');
@@ -61,25 +111,62 @@ const resolveEquipment = async (connection, equipmentInput, { validateBarcodes }
       throw new AppError(`Selected ${row.equipment_type} product is no longer active`, 409, 'PRODUCT_INACTIVE');
     }
 
+    // Manual Verification workflow — defaults describe "nothing decided
+    // yet," which is exactly correct for the update path (validateBarcodes:
+    // false): resolveEquipment doesn't validate barcodes there at all
+    // (deferred to updateWarrantyForm's per-row changed-only check, same as
+    // inventoryItemId below), so these stay at their neutral defaults and
+    // updateWarrantyForm's own loop decides the real values afterward.
     let inventoryItemId = null;
+    let verificationStatus = 'AUTO';
+    let sellerName = null;
+    let sellerPhone = null;
+    let verificationComment = null;
+    let photoFilename = null;
+
     if (validateBarcodes) {
       if (!row.serial_number) {
         throw new AppError(`A barcode is required for ${row.equipment_type}`, 400, 'BARCODE_REQUIRED');
       }
-      const item = await inventoryService.validateBarcode(connection, {
+      // Reuses the exact validateBarcode rule set — it's the only thing that
+      // decides AUTO vs PENDING, and it never trusts row.manual_verification
+      // as self-certifying: it re-derives the real failure reason itself and
+      // only accepts the manual path when that reason is genuinely
+      // BARCODE_NOT_FOUND (see inventoryService.validateBarcodeOrAcceptManual).
+      const resolution = await inventoryService.validateBarcodeOrAcceptManual(connection, {
         barcode: row.serial_number,
         product,
         equipmentType: row.equipment_type,
+        manualVerificationRequested: !!row.manual_verification,
+        sellerName: row.seller_name,
+        sellerPhone: row.seller_phone,
+        comment: row.comment,
+        photoFilename: row.manual_verification_photo_filename,
+        uploadedBy: actingUserId,
       });
-      inventoryItemId = item.id;
+      verificationStatus = resolution.verificationStatus;
+      inventoryItemId = resolution.inventoryItemId;
+      if (resolution.verificationStatus === 'PENDING') {
+        sellerName = resolution.sellerName;
+        sellerPhone = resolution.sellerPhone;
+        verificationComment = resolution.comment;
+        photoFilename = resolution.photoFilename;
+      }
     }
 
     resolved.push({
       equipment_type: row.equipment_type,
       product_id: product.id,
       product_name: `${product.brand} ${product.model || ''}`.trim(),
+      brand_name: null,
+      model: null,
       serial_number: row.serial_number || null,
       inventory_item_id: inventoryItemId,
+      verification_status: verificationStatus,
+      seller_name: sellerName,
+      seller_phone: sellerPhone,
+      verification_comment: verificationComment,
+      manual_verification_photo_filename: photoFilename,
     });
   }
   return resolved;
@@ -94,7 +181,20 @@ const createWarrantyForm = async (connection, employeeId, data) => {
       'INCOMPLETE_PROFILE'
     );
   }
-  const resolvedEquipment = await resolveEquipment(connection, data.equipment, { validateBarcodes: true });
+
+  // Idempotent create: the frontend generates submission_uuid once and
+  // reuses it on every retry (see routes/warrantyRoutes.js) — a retried
+  // POST (e.g. after a client-side timeout on a request that actually
+  // succeeded) must return the already-created form, never attempt a
+  // second INSERT. Checked before resolveEquipment/barcode validation so a
+  // pure retry does none of that work again and can't double-claim
+  // inventory or double-award points.
+  const existingFormId = await warrantyRepository.findBySubmissionUuid(connection, data.submission_uuid);
+  if (existingFormId) {
+    return { formId: existingFormId, created: false };
+  }
+
+  const resolvedEquipment = await resolveEquipment(connection, data.equipment, { validateBarcodes: true, actingUserId: employeeId });
 
   await connection.beginTransaction();
   try {
@@ -106,6 +206,7 @@ const createWarrantyForm = async (connection, employeeId, data) => {
     // the warranty_forms row just inserted and any earlier rows' claims in
     // this same loop (see the Phase 2 plan, section 1).
     for (const row of resolvedEquipment) {
+      if (!row.inventory_item_id) continue; // typed cylinder — nothing to claim
       await inventoryService.claimForEquipmentRow(connection, {
         itemId: row.inventory_item_id,
         productId: row.product_id,
@@ -122,6 +223,11 @@ const createWarrantyForm = async (connection, employeeId, data) => {
     // written to get each row's real id and product_id together.
     const finalEquipment = await equipmentRepository.findByWarrantyFormIds(connection, [formId]);
     for (const row of finalEquipment) {
+      // Manual Verification workflow: a row still awaiting admin review has
+      // no claimed inventory item and no confirmed identity yet — points are
+      // withheld until reviewManualVerification's approve branch awards them
+      // explicitly. A rejected row never receives points at all.
+      if (row.verification_status === 'PENDING') continue;
       await pointsService.awardForEquipmentRow(connection, {
         installerId: employeeId,
         warrantyFormId: formId,
@@ -134,9 +240,18 @@ const createWarrantyForm = async (connection, employeeId, data) => {
     }
 
     await connection.commit();
-    return formId;
+    return { formId, created: true };
   } catch (error) {
     await connection.rollback();
+    // Two near-simultaneous retries can both pass the pre-check above; the
+    // loser lands here instead, on the UNIQUE(submission_uuid) constraint.
+    // Re-read the winner's row rather than surfacing a raw DB error.
+    if (error.code === 'ER_DUP_ENTRY') {
+      const winnerFormId = await warrantyRepository.findBySubmissionUuid(connection, data.submission_uuid);
+      if (winnerFormId) {
+        return { formId: winnerFormId, created: false };
+      }
+    }
     throw error;
   }
 };
@@ -179,29 +294,112 @@ const updateWarrantyForm = async (connection, formId, userId, role, data) => {
 
     for (const row of resolvedEquipment) {
       const existingRow = existingByType.get(row.equipment_type);
+      // Raw submitted row — needed by both branches below: the "changed"
+      // branch already used this for barcode/seller resolution; the
+      // "unchanged" branch needs it too now (see the data-loss fix below),
+      // so it's looked up once, ahead of the changed/unchanged split.
+      const rawRow = (data.equipment || []).find((r) => r.equipment_type === row.equipment_type) || {};
+
+      // model/brand_name only ever differ for a typed cylinder — a no-op
+      // comparison for the other 3 types, which always have both null.
       const changed = !existingRow
         || existingRow.product_id !== row.product_id
-        || existingRow.serial_number !== row.serial_number;
+        || existingRow.serial_number !== row.serial_number
+        || existingRow.model !== row.model
+        || existingRow.brand_name !== row.brand_name;
 
       if (!changed) {
-        // Unchanged — carry over whatever inventory_item_id (possibly NULL,
-        // for a historical pre-Phase-2 row) already exists. No validation,
-        // no release, no claim, no points change.
+        // Unchanged barcode/product — carry over inventory_item_id (possibly
+        // NULL, for a historical pre-Phase-2 row) and verification_status
+        // exactly as they are: no re-validation, no release, no claim, no
+        // points change, no review outcome disturbed just because a SIBLING
+        // row on the same warranty changed.
+        //
+        // Seller info/photo are a genuinely separate, always-editable
+        // surface from the barcode/product identity above — an installer
+        // must be able to fix a seller-phone typo or attach a photo without
+        // also having to change the barcode (this used to force-overwrite
+        // whatever was just submitted with the old stored value, silently
+        // discarding the edit — see the Manual Verification review fix).
+        // Refreshed from the raw submission whenever the row is still
+        // flagged for manual verification, validated the same way the
+        // "changed" branch below validates it via SELLER_INFO_REQUIRED; if
+        // the client isn't flagging this row as manual verification at all
+        // (e.g. an old cached form state), the previously-stored values
+        // simply survive untouched, same as before this fix.
         row.inventory_item_id = existingRow.inventory_item_id;
+        row.verification_status = existingRow.verification_status;
+        if (rawRow.manual_verification) {
+          if (!rawRow.seller_name?.trim() || !rawRow.seller_phone?.trim() || !rawRow.comment?.trim()) {
+            throw new AppError(`Seller name, seller phone, and a comment are required for manual verification of ${row.equipment_type}`, 400, 'SELLER_INFO_REQUIRED');
+          }
+          row.seller_name = String(rawRow.seller_name).trim();
+          row.seller_phone = String(rawRow.seller_phone).trim();
+          row.verification_comment = String(rawRow.comment).trim();
+          row.manual_verification_photo_filename = await inventoryService.resolveOwnedPhotoFilename(connection, rawRow.manual_verification_photo_filename, userId);
+        } else {
+          row.seller_name = existingRow.seller_name;
+          row.seller_phone = existingRow.seller_phone;
+          row.verification_comment = existingRow.verification_comment;
+          row.manual_verification_photo_filename = existingRow.manual_verification_photo_filename;
+        }
         continue;
       }
       changedTypes.add(row.equipment_type);
 
+      const isTypedCylinder = row.equipment_type === 'CYLINDER' && !row.product_id;
+      if (isTypedCylinder) {
+        // No barcode/inventory/product involved — just release whatever the
+        // OLD assignment held (covers a catalog cylinder being retyped as
+        // free text) and reverse its points; a fresh award below (0 points,
+        // see resolveEquipment) replaces it.
+        if (existingRow && existingRow.inventory_item_id) {
+          await inventoryService.releaseForEquipmentRow(connection, {
+            itemId: existingRow.inventory_item_id,
+            changedBy: userId,
+            reason: 'warranty_updated_reassigned',
+          });
+        }
+        if (existingRow) {
+          await pointsService.reverseForEquipmentRow(connection, {
+            warrantyFormId: formId,
+            warrantyEquipmentId: existingRow.id,
+            reason: 'warranty_updated_reassigned',
+            createdBy: userId,
+          });
+        }
+        row.inventory_item_id = null;
+        // Same reasoning as resolveEquipment's typed-cylinder branch — this
+        // path is unrelated to Manual Verification, so it always reads as
+        // AUTO ("nothing pending review").
+        row.verification_status = 'AUTO';
+        row.seller_name = null;
+        row.seller_phone = null;
+        row.verification_comment = null;
+        row.manual_verification_photo_filename = null;
+        continue;
+      }
+
       // Changed — validate the new barcode now, authoritatively, inside the
       // tx/lock (not pre-transaction, unlike create — see resolveEquipment).
+      // Uses the raw submitted row (not the already-resolved one) for the
+      // manual-verification fields — resolveEquipment discards them for the
+      // update path, since deciding AUTO vs PENDING for a changed row is
+      // this loop's job, not resolveEquipment's (see its doc comment).
       if (!row.serial_number) {
         throw new AppError(`A barcode is required for ${row.equipment_type}`, 400, 'BARCODE_REQUIRED');
       }
       const product = await productRepository.findById(connection, row.product_id);
-      const item = await inventoryService.validateBarcode(connection, {
+      const resolution = await inventoryService.validateBarcodeOrAcceptManual(connection, {
         barcode: row.serial_number,
         product,
         equipmentType: row.equipment_type,
+        manualVerificationRequested: !!rawRow.manual_verification,
+        sellerName: rawRow.seller_name,
+        sellerPhone: rawRow.seller_phone,
+        comment: rawRow.comment,
+        photoFilename: rawRow.manual_verification_photo_filename,
+        uploadedBy: userId,
       });
 
       if (existingRow && existingRow.inventory_item_id) {
@@ -217,7 +415,10 @@ const updateWarrantyForm = async (connection, formId, userId, role, data) => {
       // since this is the same "did this row change" trigger that drives
       // inventory release/claim (see the Phase 3 plan's Critical Review #5).
       // Guarded by `existingRow` existing at all — a genuinely new row (a
-      // legacy warranty missing this slot) has nothing to reverse.
+      // legacy warranty missing this slot) has nothing to reverse. A
+      // previously-PENDING or -REJECTED row never had points awarded in the
+      // first place, so this is a safe no-op for it (see
+      // pointsService.reverseForEquipmentRow's own net===0 guard).
       if (existingRow) {
         await pointsService.reverseForEquipmentRow(connection, {
           warrantyFormId: formId,
@@ -226,13 +427,29 @@ const updateWarrantyForm = async (connection, formId, userId, role, data) => {
           createdBy: userId,
         });
       }
-      await inventoryService.claimForEquipmentRow(connection, {
-        itemId: item.id,
-        productId: row.product_id,
-        changedBy: userId,
-        reason: 'warranty_updated_reassigned',
-      });
-      row.inventory_item_id = item.id;
+
+      row.verification_status = resolution.verificationStatus;
+      if (resolution.verificationStatus === 'PENDING') {
+        // Manual Verification workflow — no item to claim; pending admin
+        // review, same as the create path.
+        row.inventory_item_id = null;
+        row.seller_name = resolution.sellerName;
+        row.seller_phone = resolution.sellerPhone;
+        row.verification_comment = resolution.comment;
+        row.manual_verification_photo_filename = resolution.photoFilename;
+      } else {
+        await inventoryService.claimForEquipmentRow(connection, {
+          itemId: resolution.inventoryItemId,
+          productId: row.product_id,
+          changedBy: userId,
+          reason: 'warranty_updated_reassigned',
+        });
+        row.inventory_item_id = resolution.inventoryItemId;
+        row.seller_name = null;
+        row.seller_phone = null;
+        row.verification_comment = null;
+        row.manual_verification_photo_filename = null;
+      }
     }
 
     await warrantyRepository.update(connection, formId, data);
@@ -246,6 +463,9 @@ const updateWarrantyForm = async (connection, formId, userId, role, data) => {
       const finalEquipment = await equipmentRepository.findByWarrantyFormIds(connection, [formId]);
       for (const row of finalEquipment) {
         if (!changedTypes.has(row.equipment_type)) continue;
+        // Manual Verification workflow: withheld until admin approval,
+        // same guard as createWarrantyForm.
+        if (row.verification_status === 'PENDING') continue;
         await pointsService.awardForEquipmentRow(connection, {
           installerId: existing.employee_id,
           warrantyFormId: formId,
@@ -256,6 +476,104 @@ const updateWarrantyForm = async (connection, formId, userId, role, data) => {
           createdBy: userId,
         });
       }
+
+      // This save may have just resolved the one row that was blocking
+      // EasyGas sync — a previously PENDING row now auto-verified or
+      // approved-pending-removed, or a previously REJECTED row replaced with
+      // a fresh submission. Only un-terminal the warranty once NO row is
+      // still PENDING or REJECTED; reuses the exact function already built
+      // for the admin's manual "Retry Sync" action (resetSyncStatus is a
+      // no-op unless the warranty is currently FAILED, so this is harmless
+      // when nothing was actually blocked).
+      const stillBlocked = finalEquipment.some(
+        (row) => row.verification_status === 'PENDING' || row.verification_status === 'REJECTED'
+      );
+      if (!stillBlocked) {
+        await warrantyRepository.resetSyncStatus(connection, formId);
+      }
+    }
+
+    await connection.commit();
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  }
+};
+
+/**
+ * Manual Verification workflow — the admin review action. Same shape as
+ * registrationRequestController's approve/reject: read, guard the write on
+ * the row's current state, and only do the associated side effect
+ * (award points / block sync) once that guarded write actually succeeds.
+ *
+ * Addressed by the equipment row's own id, not by (formId, equipmentType) —
+ * a review always targets exactly one row directly. `decision` is
+ * 'APPROVED' or 'REJECTED', validated here rather than trusted from the
+ * controller. Acquires the SAME warrantyRepository.lockForm row lock
+ * updateWarrantyForm/deleteWarrantyForm already take on the parent warranty,
+ * so a concurrent edit/delete of that warranty can never interleave with a
+ * review of one of its rows (see Critical Review #11).
+ */
+const reviewManualVerification = async (connection, equipmentId, adminUserId, { decision, notes }) => {
+  if (!['APPROVED', 'REJECTED'].includes(decision)) {
+    throw new AppError('decision must be APPROVED or REJECTED', 400, 'VALIDATION_ERROR');
+  }
+
+  const equipmentRow = await equipmentRepository.findById(connection, equipmentId);
+  if (!equipmentRow) {
+    throw new AppError('Equipment row not found', 404, 'NOT_FOUND');
+  }
+  // The warranty's OWNING employee, not adminUserId — points are always
+  // credited to whoever installed the equipment, never to the reviewer
+  // (same rule updateWarrantyForm's reaward loop already follows).
+  const ownership = await warrantyRepository.findOwnershipInfo(connection, equipmentRow.warranty_form_id);
+  if (!ownership) {
+    throw new AppError('Warranty form not found', 404, 'NOT_FOUND');
+  }
+
+  await connection.beginTransaction();
+  try {
+    const lockedForm = await warrantyRepository.lockForm(connection, equipmentRow.warranty_form_id);
+    if (!lockedForm) {
+      throw new AppError('Warranty form not found', 404, 'NOT_FOUND');
+    }
+
+    // Atomic guard: WHERE verification_status = 'PENDING'. A duplicate
+    // review request, or two admins reviewing the same row concurrently,
+    // affects 0 rows the second time — never re-reviews, and critically,
+    // never double-awards points.
+    const reviewed = await equipmentRepository.reviewVerification(connection, {
+      equipmentId,
+      decision,
+      reviewedBy: adminUserId,
+      notes,
+    });
+    if (!reviewed) {
+      throw new AppError('This equipment row has already been reviewed', 409, 'INVALID_STATE');
+    }
+
+    if (decision === 'APPROVED') {
+      await pointsService.awardForEquipmentRow(connection, {
+        installerId: ownership.employee_id,
+        warrantyFormId: equipmentRow.warranty_form_id,
+        warrantyEquipmentId: equipmentId,
+        productId: equipmentRow.product_id,
+        equipmentType: equipmentRow.equipment_type,
+        productLabel: equipmentRow.product_name,
+        createdBy: adminUserId,
+      });
+    } else {
+      // Rejection is terminal for the WHOLE warranty, not just this row —
+      // EasyGas requires a complete, valid 4-equipment submission, so one
+      // rejected slot invalidates the whole push. Reuses the exact
+      // terminal-FAILED vocabulary backfillEasyGasSkipLegacyWarranties
+      // (config/database.js) already established for "this warranty will
+      // never sync, by design, not by transient error."
+      await warrantyRepository.markSyncTerminal(
+        connection,
+        equipmentRow.warranty_form_id,
+        `Manual verification rejected — ${equipmentRow.equipment_type}`
+      );
     }
 
     await connection.commit();
@@ -312,6 +630,7 @@ module.exports = {
   resolveEquipment,
   createWarrantyForm,
   updateWarrantyForm,
+  reviewManualVerification,
   deleteWarrantyForm,
   EDIT_WINDOW_HOURS,
 };
