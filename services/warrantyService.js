@@ -64,9 +64,9 @@ const resolveEquipment = async (connection, equipmentInput, { validateBarcodes, 
 
   const resolved = [];
   for (const row of rows) {
-    // Typed cylinder: EasyGas's catalog only carries 2 CNG cylinder models —
-    // not enough for what installers actually fit — so a cylinder may be
-    // entered as free-text brand+capacity instead of a catalog product_id.
+    // Typed cylinder: the local catalog can never carry every real-world
+    // cylinder in the field, so a cylinder may be entered as free-text
+    // brand+capacity instead of a catalog product_id.
     // No product, no barcode, no inventory claim, and 0 points (there's no
     // product to look up a point value for — productPointConfigRepository.
     // getPoints safely returns 0 for a null productId, no special-casing
@@ -91,9 +91,9 @@ const resolveEquipment = async (connection, equipmentInput, { validateBarcodes, 
         // an entirely different, pre-existing bypass from Manual
         // Verification (see the isTypedCylinder branch above, checked and
         // `continue`d before this point is ever reached). AUTO here simply
-        // means "nothing pending review," so it never blocks points or
-        // EasyGas sync — unchanged from how a typed cylinder already behaved
-        // before this feature existed.
+        // means "nothing pending review," so it never blocks points —
+        // unchanged from how a typed cylinder already behaved before this
+        // feature existed.
         verification_status: 'AUTO',
         seller_name: null,
         seller_phone: null,
@@ -198,7 +198,11 @@ const createWarrantyForm = async (connection, employeeId, data) => {
 
   await connection.beginTransaction();
   try {
-    const formId = await warrantyRepository.insert(connection, employeeId, snapshot, data);
+    // Assigned inside the transaction so a rolled-back submission (e.g. a
+    // lost barcode-claim race below) releases its number back rather than
+    // leaving a permanent gap — see warrantyRepository.getNextWarrantyNumber.
+    const warrantyBookNumber = await warrantyRepository.getNextWarrantyNumber(connection, new Date().getFullYear());
+    const formId = await warrantyRepository.insert(connection, employeeId, snapshot, data, warrantyBookNumber);
 
     // Claim happens here, inside the transaction — every row already has a
     // validated inventory_item_id from resolveEquipment above. A lost race
@@ -476,21 +480,6 @@ const updateWarrantyForm = async (connection, formId, userId, role, data) => {
           createdBy: userId,
         });
       }
-
-      // This save may have just resolved the one row that was blocking
-      // EasyGas sync — a previously PENDING row now auto-verified or
-      // approved-pending-removed, or a previously REJECTED row replaced with
-      // a fresh submission. Only un-terminal the warranty once NO row is
-      // still PENDING or REJECTED; reuses the exact function already built
-      // for the admin's manual "Retry Sync" action (resetSyncStatus is a
-      // no-op unless the warranty is currently FAILED, so this is harmless
-      // when nothing was actually blocked).
-      const stillBlocked = finalEquipment.some(
-        (row) => row.verification_status === 'PENDING' || row.verification_status === 'REJECTED'
-      );
-      if (!stillBlocked) {
-        await warrantyRepository.resetSyncStatus(connection, formId);
-      }
     }
 
     await connection.commit();
@@ -552,6 +541,10 @@ const reviewManualVerification = async (connection, equipmentId, adminUserId, { 
       throw new AppError('This equipment row has already been reviewed', 409, 'INVALID_STATE');
     }
 
+    // A REJECTED row simply never earns points — no further action needed:
+    // its verification_status alone (already flipped by reviewVerification
+    // above) is what excludes it from every "confirmed installed" count
+    // reports/statistics already key off (see reportsController.js).
     if (decision === 'APPROVED') {
       await pointsService.awardForEquipmentRow(connection, {
         installerId: ownership.employee_id,
@@ -562,18 +555,6 @@ const reviewManualVerification = async (connection, equipmentId, adminUserId, { 
         productLabel: equipmentRow.product_name,
         createdBy: adminUserId,
       });
-    } else {
-      // Rejection is terminal for the WHOLE warranty, not just this row —
-      // EasyGas requires a complete, valid 4-equipment submission, so one
-      // rejected slot invalidates the whole push. Reuses the exact
-      // terminal-FAILED vocabulary backfillEasyGasSkipLegacyWarranties
-      // (config/database.js) already established for "this warranty will
-      // never sync, by design, not by transient error."
-      await warrantyRepository.markSyncTerminal(
-        connection,
-        equipmentRow.warranty_form_id,
-        `Manual verification rejected — ${equipmentRow.equipment_type}`
-      );
     }
 
     await connection.commit();

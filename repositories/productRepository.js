@@ -20,7 +20,7 @@ const findAllPaginated = async (connection, { page, limit, search, category }) =
 
   const [countRows] = await connection.execute(`SELECT COUNT(*) AS total FROM products ${whereClause}`, params);
   const [rows] = await connection.execute(
-    `SELECT * FROM products ${whereClause} ORDER BY created_at DESC LIMIT ${limit} OFFSET ${offset}`,
+    `SELECT * FROM products p ${whereClause} ORDER BY created_at DESC LIMIT ${limit} OFFSET ${offset}`,
     params
   );
   return { rows, total: countRows[0].total };
@@ -84,18 +84,34 @@ const findById = async (connection, productId) => {
   return rows[0] || null;
 };
 
-const create = async (connection, { category, brand, model, fuel_type }) => {
+// brand is always denormalized from the linked local brand (brands.name),
+// never accepted as free text — products.brand stays a real column (rather
+// than a JOIN everywhere) purely because search/getDistinctBrands above
+// already key off it; brand_id is the actual relationship.
+const create = async (connection, { category, brand_id, model, fuel_type }) => {
+  const [brandRows] = await connection.execute('SELECT name FROM brands WHERE id = ?', [brand_id]);
+  if (!brandRows[0]) {
+    const err = new Error('Selected brand does not exist');
+    err.errorCode = 'BRAND_NOT_FOUND';
+    throw err;
+  }
   const [result] = await connection.execute(
-    'INSERT INTO products (category, brand, model, fuel_type) VALUES (?, ?, ?, ?)',
-    [category, brand.trim(), model?.trim() || null, fuel_type || null]
+    'INSERT INTO products (category, brand, brand_id, model, fuel_type) VALUES (?, ?, ?, ?, ?)',
+    [category, brandRows[0].name, brand_id, model?.trim() || null, fuel_type || null]
   );
   return result.insertId;
 };
 
-const update = async (connection, productId, { category, brand, model, fuel_type }) => {
+const update = async (connection, productId, { category, brand_id, model, fuel_type }) => {
+  const [brandRows] = await connection.execute('SELECT name FROM brands WHERE id = ?', [brand_id]);
+  if (!brandRows[0]) {
+    const err = new Error('Selected brand does not exist');
+    err.errorCode = 'BRAND_NOT_FOUND';
+    throw err;
+  }
   await connection.execute(
-    'UPDATE products SET category = ?, brand = ?, model = ?, fuel_type = ? WHERE id = ?',
-    [category, brand.trim(), model?.trim() || null, fuel_type || null, productId]
+    'UPDATE products SET category = ?, brand = ?, brand_id = ?, model = ?, fuel_type = ? WHERE id = ?',
+    [category, brandRows[0].name, brand_id, model?.trim() || null, fuel_type || null, productId]
   );
 };
 

@@ -2,6 +2,7 @@ const inventoryRepository = require('../repositories/inventoryRepository');
 const inventoryImportBatchRepository = require('../repositories/inventoryImportBatchRepository');
 const inventoryAuditLogRepository = require('../repositories/inventoryAuditLogRepository');
 const manualVerificationUploadRepository = require('../repositories/manualVerificationUploadRepository');
+const productRepository = require('../repositories/productRepository');
 const AppError = require('../utils/AppError');
 const { EQUIPMENT_TYPE_TO_CATEGORIES } = require('../config/equipmentCategories');
 const { extractBarcodeCandidates } = require('../utils/csvBarcodeParser');
@@ -25,6 +26,11 @@ const isValidBarcode = (line) => /^[A-Za-z0-9-]+$/.test(line);
  * rollup (`duplicates + errors` — total rows that did NOT get imported).
  */
 const importCsv = async (connection, { productId, buffer, uploadedBy, fileName, branchId }) => {
+  const product = await productRepository.findById(connection, productId);
+  if (!product) {
+    throw new AppError('Product not found', 404, 'PRODUCT_NOT_FOUND');
+  }
+
   // csv-parse/sync can throw synchronously on genuinely malformed input
   // (e.g. an unbalanced quote) — the old line-splitter never threw here, so
   // this is wrapped and surfaced as a clean 400 instead of an unhandled 500;
@@ -301,10 +307,9 @@ const transferBranch = async (connection, { itemId, newBranchId, reason, changed
  * Corrects a barcode string (serves both "replace damaged barcode" and
  * "correct incorrect imports" — see the Phase 4 plan's Critical Review #5).
  * Restricted to non-INSTALLED items: warranty_equipment.serial_number is a
- * denormalized copy taken at claim time and never re-derived, and the
- * EasyGas sync payload is built from that same copy — correcting a barcode
- * on a live, installed item would silently desync both with no automatic
- * path to re-push the corrected value (see D5). Fixing a barcode on a
+ * denormalized copy taken at claim time and never re-derived, so correcting
+ * a barcode on a live, installed item would silently desync the two with no
+ * automatic path to fix the copy back up (see D5). Fixing a barcode on a
  * currently-installed item is out of scope here — the existing edit-
  * warranty flow (release + reclaim) already covers that if ever needed.
  */

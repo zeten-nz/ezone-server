@@ -29,9 +29,8 @@
 | Validation | express-validator |
 | Uploads | multer — disk storage + magic-byte verification for photos, memory storage for CSV |
 | Excel/CSV | exceljs (legacy XLSX export), csv-parse (CSV inventory-import parsing) |
-| Scheduled jobs | No job-scheduler package — plain `setInterval` polling loops (see [04-backend.md](04-backend.md)) |
+| Scheduled jobs | None — no job-scheduler package, no background polling loops; all work happens synchronously within the request/transaction that triggers it |
 | Package manager | npm |
-| Partner integration | Native `fetch` + `crypto` (Node built-ins) — HMAC-SHA256 signing shared between both EasyGas clients via `utils/easyGasSigning.js`, no HTTP client library dependency added |
 
 ### Database
 
@@ -50,16 +49,15 @@
 | Folder | Purpose |
 |---|---|
 | `config/` | Static config + the entire DB schema/migrations (`database.js`), plus `csvLabels.js` (bilingual CSV export labels), `equipmentCategories.js`, `externalCategoryMap.js`, `mockData.js` (dev-only seed data), `uploads.js` (multer setup), `validation.js` |
-| `controllers/` | Thin HTTP handlers — one per domain (auth, users, warranty, inventory, products, branches, cars, reports, registration requests, legacy Excel export, CSV export). **The public customer-lookup controller was removed this session** — see [09-security.md](09-security.md). |
-| `services/` | Business logic and transaction boundaries — `warrantyService.js`, `inventoryService.js`, `pointsService.js`, `productService.js`, `validationService.js`, and five `easyGas*.js` integration/sync files (`easyGasWarrantyClient.js`, `easyGasCatalogClient.js`, `easyGasSyncService.js`, `easyGasSyncSweep.js`, `easyGasCatalogSyncService.js`, `easyGasCatalogSyncSweep.js`) |
-| `repositories/` | Parameterized SQL access, one file per aggregate root (warranty, equipment, product, inventory, inventory-audit-log, inventory-import-batch, point-transaction, product-point-config, car) |
+| `controllers/` | Thin HTTP handlers — one per domain (auth, users, warranty, inventory, products, brands, cars, branches, reports, registration requests, legacy Excel export, CSV export). **The public customer-lookup controller was removed this session** — see [09-security.md](09-security.md). |
+| `services/` | Business logic and transaction boundaries — `warrantyService.js`, `inventoryService.js`, `pointsService.js`, `productService.js`, `validationService.js` |
+| `repositories/` | Parameterized SQL access, one file per aggregate root (warranty, equipment, product, brand, car, inventory, inventory-audit-log, inventory-import-batch, point-transaction, product-point-config) |
 | `routes/` | Express routers wiring URLs → middleware → controllers, one per domain. **`routes/publicCustomerRoutes.js` was removed this session.** |
 | `middleware/` | `auth.js` (JWT verify + role checks), `errorHandler.js` (centralized error/404 responses), `validateEnv.js` (startup config validation) |
 | `dtos/` | Exactly one file, `warrantyDTO.js` — response shaping for the warranty domain only |
-| `utils/` | `AppError.js`, `csvBarcodeParser.js`, `csvStream.js`, `vehicleName.js`, `warrantyEquipment.js`, plus two added this session: `phoneFormat.js` (best-effort `+998` canonicalization before an EasyGas push) and `easyGasSigning.js` (HMAC signing shared by both EasyGas clients) |
+| `utils/` | `AppError.js`, `csvBarcodeParser.js`, `csvStream.js`, `vehicleName.js`, `warrantyEquipment.js`, `phoneFormat.js` (best-effort `+998` phone-number canonicalization) |
 | `uploads/` | Runtime-written photo storage — `profile-photos/`, `registration-photos/`. Gitignored; must be preserved across deploys |
-| `docs/` | This documentation (now 12 numbered files, up from 10), plus deployment/update/backup guides |
-| `test-easygas-connection.js` | New this session, repo root — a permanent, manually-invoked connectivity/contract smoke-script against the real EasyGas API (`npm run easygas:test-connection`). Never called by the app itself. |
+| `docs/` | This documentation (11 numbered files), plus deployment/update/backup guides |
 
 ### `ezone/src/`
 

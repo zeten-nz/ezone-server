@@ -33,12 +33,14 @@ router.get('/', getAllProducts);
 
 router.post('/', [
   body('category').isIn(PRODUCT_CATEGORIES).withMessage('Invalid category'),
-  body('brand').trim().notEmpty().withMessage('Brand is required'),
+  body('brand_id').isInt().withMessage('A brand must be selected'),
+  body('fuel_type').optional({ checkFalsy: true }).isIn(['LPG', 'CNG']).withMessage('Invalid fuel type'),
 ], createProduct);
 
 router.put('/:productId', [
   body('category').isIn(PRODUCT_CATEGORIES).withMessage('Invalid category'),
-  body('brand').trim().notEmpty().withMessage('Brand is required'),
+  body('brand_id').isInt().withMessage('A brand must be selected'),
+  body('fuel_type').optional({ checkFalsy: true }).isIn(['LPG', 'CNG']).withMessage('Invalid fuel type'),
 ], updateProduct);
 
 router.patch('/:productId/activate', activateProduct);

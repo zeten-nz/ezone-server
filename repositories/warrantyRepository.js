@@ -38,7 +38,27 @@ const getEmployeeSnapshot = async (connection, employeeId) => {
   return employee;
 };
 
-const insert = async (connection, employeeId, snapshot, data) => {
+/**
+ * Local, sequential, per-year warranty numbering (W-2026-000001, ...) —
+ * EZONE's own, with no external dependency. Atomic under concurrent
+ * submissions via the documented MySQL idiom for emulating a sequence on a
+ * non-AUTO_INCREMENT column: `LAST_INSERT_ID(expr)` in BOTH the INSERT's
+ * VALUES and the ON DUPLICATE KEY UPDATE clause sets the session's
+ * last-insert-id to `expr` either way, so `result.insertId` is correct
+ * whether this is the first warranty of the year (fresh row) or the Nth
+ * (existing row incremented) — using only the VALUES-clause literal would
+ * leave insertId wrong (stale/0) on that first-of-the-year branch.
+ */
+const getNextWarrantyNumber = async (connection, year) => {
+  const [result] = await connection.execute(
+    `INSERT INTO warranty_number_sequences (year, last_number) VALUES (?, LAST_INSERT_ID(1))
+     ON DUPLICATE KEY UPDATE last_number = LAST_INSERT_ID(last_number + 1)`,
+    [year]
+  );
+  return `W-${year}-${String(result.insertId).padStart(6, '0')}`;
+};
+
+const insert = async (connection, employeeId, snapshot, data, warrantyBookNumber) => {
   const [result] = await connection.execute(
     `INSERT INTO warranty_forms (
        employee_id, installer_region, city, installer_district, installer_branch, organization_phone,
@@ -50,7 +70,7 @@ const insert = async (connection, employeeId, snapshot, data) => {
     [
       employeeId, snapshot.region, snapshot.city || null, snapshot.district, snapshot.branch_name, snapshot.branch_phone || null,
       snapshot.full_name, snapshot.installer_phone || null, snapshot.branch_code,
-      data.submission_uuid, data.warranty_book_number || null, data.installation_date, data.fuel_type,
+      data.submission_uuid, warrantyBookNumber, data.installation_date, data.fuel_type,
       data.vehicle_name, data.car_id || null, data.vehicle_production_year, data.vehicle_plate_number || null, data.vehicle_vin, data.vehicle_mileage,
       data.owner_full_name, data.owner_phone,
     ]
@@ -62,15 +82,13 @@ const insert = async (connection, employeeId, snapshot, data) => {
 // installer_branch_code are deliberately absent here — they're a one-time
 // snapshot taken at creation (see getEmployeeSnapshot), never re-derived or
 // overwritten by an edit even if the employee's branch changes later.
-// submission_uuid is ALSO deliberately absent — it's EasyGas's idempotency
-// key for this warranty's whole lifecycle, set once at creation and
-// immutable afterward, same treatment as the snapshot fields above.
-// warranty_book_number is deliberately absent too: installers no longer
-// type one, so an edit must never overwrite it — old rows keep their
-// installer-typed value forever, new rows keep whatever the sync sweep last
-// wrote (or NULL until it succeeds). The easygas_sync_* columns are equally
-// absent — they're only ever written by the sync sweep
-// (services/easyGasSyncSweep.js), never by a form edit.
+// submission_uuid is ALSO deliberately absent — it's this warranty's
+// create-idempotency key (protects against a client retrying a POST it
+// doesn't know already succeeded), set once at creation and immutable
+// afterward, same treatment as the snapshot fields above.
+// warranty_book_number is deliberately absent too: it's assigned once, at
+// creation, by warrantyRepository.getNextWarrantyNumber — an edit must never
+// reassign or overwrite it.
 const update = async (connection, formId, data) => {
   await connection.execute(
     `UPDATE warranty_forms SET
@@ -210,80 +228,6 @@ const searchForms = async (connection, { search, filterType }) => {
   return rows;
 };
 
-/**
- * Manual admin "retry sync" action (see easyGasSyncSweep.js for the
- * automatic side) — only resets a row currently sitting in FAILED, terminal
- * or not: retrying a non-terminal FAILED row is redundant (the sweep already
- * retries those on its own), and retrying a PENDING/SYNCING/SYNCED row makes
- * no sense. Clears easygas_sync_terminal/easygas_last_error too — if the
- * underlying data was corrected, the next sweep attempt deserves a clean
- * slate, not a stale terminal flag lingering until the new attempt resolves.
- *
- * Manual Verification workflow — the NOT EXISTS guard below is deliberately
- * baked into this shared function's own WHERE clause, not left to each
- * caller to remember: a warranty with any row still PENDING or REJECTED
- * must never become sync-eligible again, no matter which caller resets it
- * (today: warrantyController.retryWarrantySync and
- * warrantyService.updateWarrantyForm's own "no longer blocked" check; any
- * future caller is protected the same way automatically, since the
- * restriction lives in the query itself, not in caller-side judgment).
- * APPROVED rows are unaffected — only PENDING (unreviewed) and REJECTED
- * (a deliberate decision that this equipment isn't a confirmed installation)
- * block a reset; the same rows easyGasSyncSweep.js's candidate query already
- * excludes for PENDING, extended here to also cover REJECTED for this
- * specific "someone is trying to force it back to PENDING" action.
- */
-const resetSyncStatus = async (connection, formId) => {
-  const [result] = await connection.execute(
-    `UPDATE warranty_forms
-     SET easygas_sync_status = 'PENDING', easygas_sync_terminal = FALSE, easygas_last_error = NULL
-     WHERE id = ? AND easygas_sync_status = 'FAILED'
-       AND NOT EXISTS (
-         SELECT 1 FROM warranty_equipment we
-         WHERE we.warranty_form_id = warranty_forms.id AND we.verification_status IN ('PENDING', 'REJECTED')
-       )`,
-    [formId]
-  );
-  return result.affectedRows === 1;
-};
-
-/**
- * Diagnostic-only helper for retryWarrantySync's controller — resetSyncStatus
- * above is what actually enforces the block (this function grants no
- * capability and is never a security boundary itself); this just lets the
- * controller tell an admin *why* a reset didn't happen (still FAILED-but-
- * blocked vs. not FAILED at all) instead of one generic message covering both.
- */
-const hasUnresolvedManualVerification = async (connection, formId) => {
-  const [rows] = await connection.execute(
-    `SELECT 1 FROM warranty_equipment WHERE warranty_form_id = ? AND verification_status IN ('PENDING', 'REJECTED') LIMIT 1`,
-    [formId]
-  );
-  return rows.length > 0;
-};
-
-/**
- * Manual Verification workflow — called only from warrantyService.
- * reviewManualVerification's reject branch, immediately after
- * equipmentRepository.reviewVerification has already guarded-and-flipped
- * that one row to REJECTED. Reuses the exact terminal-FAILED vocabulary
- * backfillEasyGasSkipLegacyWarranties (config/database.js) already
- * established for "this warranty will never sync, by design, not by
- * transient error" — no new sync-status enum value needed. Unconditional
- * (no status guard): a warranty with any row still able to be rejected can
- * never have already reached SYNCED (the sweep's NOT EXISTS gate keeps it at
- * PENDING for as long as that row stays PENDING — see easyGasSyncSweep.js),
- * so there is no state this could incorrectly overwrite.
- */
-const markSyncTerminal = async (connection, formId, message) => {
-  await connection.execute(
-    `UPDATE warranty_forms
-     SET easygas_sync_status = 'FAILED', easygas_sync_terminal = TRUE, easygas_last_error = ?
-     WHERE id = ?`,
-    [message.slice(0, 255), formId]
-  );
-};
-
 const deleteById = async (connection, formId) => {
   // warranty_equipment rows for this form are cleaned up automatically via
   // ON DELETE CASCADE — no manual unlink step needed (unlike the old
@@ -301,18 +245,32 @@ const deleteById = async (connection, formId) => {
  * (see the Phase 4 plan's D6). Ordered by id, not created_at, for the same
  * reason — a stable, monotonic cursor.
  */
-const findChunkForExport = async (connection, { lastId, limit, employeeId }) => {
+const findChunkForExport = async (connection, { lastId, limit, employeeId, search, verificationStatus }) => {
+  const conditions = ['wf.id > ?'];
   const params = [lastId];
-  let employeeClause = '';
   if (employeeId) {
-    employeeClause = 'AND wf.employee_id = ?';
+    conditions.push('wf.employee_id = ?');
     params.push(employeeId);
+  }
+  // Same filter conditions as findAllPaginated, kept in exact sync so
+  // "export filtered results" always exports what the list is actually
+  // showing — see findAllPaginated above for why each is shaped this way.
+  if (verificationStatus) {
+    conditions.push(`EXISTS (
+      SELECT 1 FROM warranty_equipment we
+      WHERE we.warranty_form_id = wf.id AND we.verification_status = ?
+    )`);
+    params.push(verificationStatus);
+  }
+  if (search) {
+    conditions.push('(wf.vehicle_plate_number LIKE ? OR wf.owner_full_name LIKE ? OR u.full_name LIKE ?)');
+    params.push(`%${search}%`, `%${search}%`, `%${search}%`);
   }
   const [rows] = await connection.execute(
     `SELECT wf.*, u.full_name AS employee_name, u.username AS employee_username, ${FUEL_TYPE_SELECT}
      FROM warranty_forms wf JOIN users u ON wf.employee_id = u.id
      ${FUEL_TYPE_JOIN}
-     WHERE wf.id > ? ${employeeClause}
+     WHERE ${conditions.join(' AND ')}
      ORDER BY wf.id ASC LIMIT ${Number(limit)}`,
     params
   );
@@ -321,6 +279,7 @@ const findChunkForExport = async (connection, { lastId, limit, employeeId }) => 
 
 module.exports = {
   getEmployeeSnapshot,
+  getNextWarrantyNumber,
   insert,
   update,
   findOwnershipInfo,
@@ -330,9 +289,6 @@ module.exports = {
   findMinePaginated,
   findDetailById,
   searchForms,
-  resetSyncStatus,
-  hasUnresolvedManualVerification,
-  markSyncTerminal,
   deleteById,
   findChunkForExport,
 };

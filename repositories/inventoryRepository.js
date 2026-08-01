@@ -148,7 +148,7 @@ const findAllPaginated = async (connection, {
           WHERE h2.inventory_item_id = h.inventory_item_id AND h2.to_status = 'INSTALLED'
         )
         ${claimedFrom ? 'AND h.created_at >= ?' : ''}
-        ${claimedTo ? 'AND h.created_at <= ?' : ''}
+        ${claimedTo ? 'AND h.created_at < DATE_ADD(?, INTERVAL 1 DAY)' : ''}
     )`);
     if (claimedFrom) params.push(claimedFrom);
     if (claimedTo) params.push(claimedTo);
@@ -181,10 +181,10 @@ const insertStatusHistory = async (connection, { inventoryItemId, fromStatus, to
 };
 
 /**
- * Atomic claim — same race-guard shape as easyGasSyncSweep.js's
- * UPDATE ... WHERE status='PENDING' LIMIT 1 pattern, checked via
- * affectedRows. Not yet called by anything (warranty integration is
- * Phase 2) — present now so Phase 2 doesn't need new repository plumbing.
+ * Atomic claim — an UPDATE ... WHERE status='PENDING' LIMIT 1 guard,
+ * checked via affectedRows. Not yet called by anything (warranty
+ * integration is Phase 2) — present now so Phase 2 doesn't need new
+ * repository plumbing.
  */
 const claimForInstallation = async (connection, { itemId, productId }) => {
   const [result] = await connection.execute(
@@ -240,14 +240,13 @@ const transferBranch = async (connection, { itemId, branchId }) => {
 };
 
 // Restricted to non-INSTALLED items at the service layer (see
-// inventoryService.correctBarcode) — this UPDATE itself only guards against
-// the barcode having changed underneath the admin (rare, but the same
-// discipline applies) via affectedRows, not the status restriction, which
-// needs a fresher read than a single UPDATE's WHERE clause can express
-// cleanly against a value the admin didn't submit.
+// inventoryService.correctBarcode) — the UPDATE itself guards against both
+// the barcode having changed underneath the admin AND the item having been
+// claimed (status flipped to INSTALLED) since the service's earlier read,
+// atomically, the same discipline mergeDuplicate below already uses.
 const correctBarcode = async (connection, { itemId, oldBarcode, newBarcode }) => {
   const [result] = await connection.execute(
-    `UPDATE inventory_items SET barcode = ? WHERE id = ? AND barcode = ? LIMIT 1`,
+    `UPDATE inventory_items SET barcode = ? WHERE id = ? AND barcode = ? AND status != 'INSTALLED' LIMIT 1`,
     [newBarcode, itemId, oldBarcode]
   );
   return result.affectedRows === 1;

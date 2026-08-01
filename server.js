@@ -80,6 +80,7 @@ const warrantyRoutes                  = require('./routes/warrantyRoutes');
 const registrationRequestRoutes       = require('./routes/registrationRequestRoutes');
 const branchRoutes                    = require('./routes/branchRoutes');
 const productRoutes                   = require('./routes/productRoutes');
+const brandRoutes                     = require('./routes/brandRoutes');
 const reportsRoutes                   = require('./routes/reportsRoutes');
 const carRoutes                       = require('./routes/carRoutes');
 const inventoryRoutes                 = require('./routes/inventoryRoutes');
@@ -231,6 +232,7 @@ app.use('/api/warranty', warrantyRoutes);
 app.use('/api/registration-requests', registrationRequestRoutes);
 app.use('/api/branches', branchRoutes);
 app.use('/api/products', productRoutes);
+app.use('/api/brands', brandRoutes);
 app.use('/api/reports', reportsRoutes);
 app.use('/api/cars', carRoutes);
 app.use('/api/inventory', inventoryRoutes);
@@ -357,19 +359,10 @@ const startServer = async () => {
     const loadMockData = !isProduction && process.env.LOAD_MOCK_DATA === 'true';
     await initializeDatabase(loadMockData);
 
-    // Starts the EasyGas retry sweep — the only path that pushes a warranty
-    // to EasyGas (see services/easyGasSyncSweep.js for why there's no
-    // fire-and-forget push inside createWarrantyForm/updateWarrantyForm).
-    // Safe to start even before EASYGAS_WARRANTY_API_BASE_URL/SHARED_SECRET
-    // are configured — every submission just accumulates as PENDING/retries
-    // until the real credentials arrive at go-live.
-    const { startEasyGasSyncSweep } = require('./services/easyGasSyncSweep');
-    startEasyGasSyncSweep(pool);
-
     // Manual Verification workflow — removes photo uploads that were never
     // attached to a warranty (abandoned form, or replaced before saving).
-    // Same crash-safety contract as the sweep above; a 24h grace period
-    // means nothing mid-form-fill is ever at risk.
+    // Crash-safe: a bug here must never take down the whole process. A 24h
+    // grace period means nothing mid-form-fill is ever at risk.
     const { startManualVerificationUploadCleanupSweep } = require('./services/manualVerificationUploadCleanupSweep');
     startManualVerificationUploadCleanupSweep(pool);
 

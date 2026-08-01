@@ -92,10 +92,10 @@ async function ensureColumn(connection, table, column, definition) {
  * columns are compared directly (a JOIN or WHERE ... = another column,
  * never a bound `?` parameter), which throws "Illegal mix of collations"
  * and fails outright — confirmed the hard way by warranty_forms.
- * installer_branch_code vs branches.code (see cleanupAccidentalAdminBranches
- * and easyGasSyncService.js's syncWarranty, which joins the same two
- * columns and had never actually been exercised against a real PENDING row
- * yet). `definition` must repeat the column's full, unchanged type/
+ * installer_branch_code vs branches.code (see cleanupAccidentalAdminBranches,
+ * which joins the same two columns and had never actually been exercised
+ * against a real row with a mismatched collation yet). `definition` must
+ * repeat the column's full, unchanged type/
  * nullability/default — MODIFY COLUMN replaces the whole definition, not
  * just the collation.
  */
@@ -396,35 +396,6 @@ async function backfillWarrantyFuelType(connection) {
   }
 }
 
-/**
- * One-time, idempotent exclusion of pre-integration warranties from the
- * EasyGas retry sweep. easygas_sync_status was added as NOT NULL DEFAULT
- * 'PENDING', which retroactively flags every warranty that already existed
- * as needing a push — but those rows predate submission_uuid entirely (the
- * client only started minting one after this migration shipped) and were
- * never meant to be sent. Left as PENDING, they permanently starve the
- * sweep: it always claims the oldest 10 PENDING rows by created_at, these
- * legacy rows can never succeed (no submission_uuid) so they cycle right
- * back to PENDING every cycle, and real new submissions queued behind them
- * never get a turn (confirmed live — a freshly submitted warranty sat
- * PENDING for 2+ sweep cycles behind a 159-row legacy backlog). Marking
- * them FAILED+terminal reuses the sweep's existing "never auto-retry"
- * semantics instead of growing the status enum. Only touches rows still at
- * the untouched PENDING/NULL-uuid combination, so safe to re-run every boot.
- */
-async function backfillEasyGasSkipLegacyWarranties(connection) {
-  const [result] = await connection.execute(`
-    UPDATE warranty_forms
-    SET easygas_sync_status = 'FAILED',
-        easygas_sync_terminal = TRUE,
-        easygas_last_error = 'Predates EasyGas integration — never submitted'
-    WHERE submission_uuid IS NULL AND easygas_sync_status = 'PENDING'
-  `);
-  if (result.affectedRows > 0) {
-    console.log(`[DB] Migration: excluded ${result.affectedRows} pre-integration warranty_forms row(s) from EasyGas sync`);
-  }
-}
-
 const initializeDatabase = async (loadMockData = false) => {
   let connection;
   try {
@@ -594,16 +565,23 @@ const initializeDatabase = async (loadMockData = false) => {
     // layer for all new submissions.
     await ensureColumn(connection, 'warranty_forms', 'fuel_type', 'fuel_type ENUM(\'LPG\', \'CNG\') NULL AFTER installation_date');
 
-    // EasyGas integration — they become the source of truth for warranty
-    // data and generate the official 14-digit warranty number, so installers
-    // stop typing one. warranty_book_number is relaxed to nullable (new
-    // submissions leave it empty until sync succeeds and copies EasyGas's
-    // number in; old installer-typed values are untouched). Sync is always
-    // local-first and asynchronous — see services/easyGasSyncSweep.js — so
-    // none of these columns are ever written inside the create/update
-    // transaction itself, only by the sweep afterward.
+    // warranty_book_number: now assigned automatically at creation by
+    // warrantyRepository.getNextWarrantyNumber (local sequential
+    // W-<year>-<000001>, see the warranty_number_sequences table below) —
+    // nullable at the schema level only because historical rows predate
+    // that mechanism.
     await ensureNullableColumn(connection, 'warranty_forms', 'warranty_book_number', 'warranty_book_number VARCHAR(100) NULL');
+    // submission_uuid: this warranty's own create-idempotency key (protects
+    // against a client retrying a POST it doesn't know already succeeded) —
+    // no external integration involved.
     await ensureColumn(connection, 'warranty_forms', 'submission_uuid', 'submission_uuid VARCHAR(36) NULL UNIQUE AFTER warranty_book_number');
+    // DEPRECATED (EasyGas integration removed) — easygas_sync_status,
+    // easygas_sync_terminal, easygas_sync_attempts, easygas_sync_claimed_at,
+    // easygas_synced_at, easygas_warranty_number, easygas_last_error below
+    // are no longer read or written by any application code. Left in place
+    // (idempotent no-ops on every boot after the first) so historical rows
+    // stay intact; scheduled for removal in a dedicated future migration
+    // once the app has run clean for a while with these untouched.
     await ensureColumn(connection, 'warranty_forms', 'easygas_sync_status', 'easygas_sync_status ENUM(\'PENDING\', \'SYNCING\', \'SYNCED\', \'FAILED\') NOT NULL DEFAULT \'PENDING\' AFTER submission_uuid');
     await ensureColumn(connection, 'warranty_forms', 'easygas_sync_terminal', 'easygas_sync_terminal BOOLEAN NOT NULL DEFAULT FALSE AFTER easygas_sync_status');
     await ensureColumn(connection, 'warranty_forms', 'easygas_sync_attempts', 'easygas_sync_attempts INT NOT NULL DEFAULT 0 AFTER easygas_sync_terminal');
@@ -611,6 +589,17 @@ const initializeDatabase = async (loadMockData = false) => {
     await ensureColumn(connection, 'warranty_forms', 'easygas_synced_at', 'easygas_synced_at TIMESTAMP NULL DEFAULT NULL AFTER easygas_sync_claimed_at');
     await ensureColumn(connection, 'warranty_forms', 'easygas_warranty_number', 'easygas_warranty_number VARCHAR(20) NULL AFTER easygas_synced_at');
     await ensureColumn(connection, 'warranty_forms', 'easygas_last_error', 'easygas_last_error VARCHAR(255) NULL AFTER easygas_warranty_number');
+
+    // Local, sequential, per-year warranty numbering (W-2026-000001, ...) —
+    // see warrantyRepository.getNextWarrantyNumber for the atomic-increment
+    // mechanism. One row per year; last_number is the most recently issued
+    // sequence number for that year.
+    await connection.execute(`
+      CREATE TABLE IF NOT EXISTS warranty_number_sequences (
+        year        INT PRIMARY KEY,
+        last_number INT NOT NULL DEFAULT 0
+      ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+    `);
 
     // Create registration_requests table — new employee accounts start here,
     // PENDING and with zero permissions, until an admin approves them (which
@@ -703,14 +692,10 @@ const initializeDatabase = async (loadMockData = false) => {
       'CONTROLLER'
     );
 
-    // Ships now, unused until the external STAG catalog integration:
-    // external_id lets a future find-or-create-by-external-id upsert map a
-    // STAG-sourced product onto a real local row (required since
-    // warranty_equipment.product_id is a NOT NULL FK — every product used
-    // in a warranty must resolve to a local row regardless of where its
-    // data originally came from). synced_at tracks cache freshness once
-    // that sync path exists. Both nullable/unused today — no admin-created
-    // row has either.
+    // DEPRECATED (EasyGas integration removed) — external_id/synced_at are no
+    // longer read or written by any application code; left in place so
+    // historical rows stay intact, scheduled for removal in a dedicated
+    // future migration.
     await ensureColumn(connection, 'products', 'external_id', 'external_id VARCHAR(100) NULL UNIQUE AFTER model');
     await ensureColumn(connection, 'products', 'synced_at', 'synced_at TIMESTAMP NULL DEFAULT NULL AFTER is_active');
 
@@ -746,16 +731,12 @@ const initializeDatabase = async (loadMockData = false) => {
       ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
     `);
 
-    // ── EasyGas Phase 2: catalog sync (brands/cars/products) ────────────────
-    // EasyGas becomes the source of truth for the equipment brand and vehicle
-    // catalogs too, not just warranty submission — installers search these
-    // instead of typing free text, mirroring the Brand->Product cascading
-    // search already built for the local catalog. brands/cars are their own
-    // tables, not folded into `products`'s shape: a car has no
-    // fuel_type/category, and confirmed via the plan review that products and
-    // cars have genuinely different upsert shapes (products.brand_id needs
-    // brands already synced and resolved; cars.brand/model are flat
-    // denormalized strings with no such dependency).
+    // ── Brands / Cars: local ERP master data ─────────────────────────────────
+    // Equipment brand catalog (e.g. "STAG", "ADAX") and vehicle catalog (e.g.
+    // "Chevrolet Cobalt") — plain admin-managed reference data, full CRUD via
+    // brandRepository.js/carRepository.js. products.brand_id links to brands;
+    // warranty_forms.car_id links to cars (free-text fallback always valid
+    // when no catalog match exists).
     await connection.execute(`
       CREATE TABLE IF NOT EXISTS brands (
         id          INT PRIMARY KEY AUTO_INCREMENT,
@@ -767,14 +748,17 @@ const initializeDatabase = async (loadMockData = false) => {
       ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
     `);
 
-    // Brands must mirror EasyGas's own /product-brands response fully, not
-    // just id+name — confirmed sample includes full_name/country/logo too,
-    // and there's no reason to keep our own copy lossier than the source
-    // (see the products-architecture memory: EasyGas is the sole source of
-    // truth for brands, we never invent our own).
     await ensureColumn(connection, 'brands', 'full_name', 'full_name VARCHAR(255) NULL AFTER name');
     await ensureColumn(connection, 'brands', 'country', 'country VARCHAR(100) NULL AFTER full_name');
     await ensureColumn(connection, 'brands', 'logo_url', 'logo_url VARCHAR(500) NULL AFTER country');
+    // is_active: same soft-disable convention as products/cars/branches — a
+    // deactivated brand stops appearing in the Product form's Brand select
+    // without losing history on any product that already references it.
+    await ensureColumn(connection, 'brands', 'is_active', 'is_active BOOLEAN NOT NULL DEFAULT TRUE AFTER logo_url');
+    // DEPRECATED (EasyGas integration removed) — external_id/synced_at are no
+    // longer read or written by any application code; left in place so
+    // historical rows stay intact, scheduled for removal in a dedicated
+    // future migration.
 
     await connection.execute(`
       CREATE TABLE IF NOT EXISTS cars (
@@ -788,6 +772,10 @@ const initializeDatabase = async (loadMockData = false) => {
         updated_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
       ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
     `);
+    // DEPRECATED (EasyGas integration removed) — external_id/external_updated_at/
+    // synced_at above are no longer read or written by any application code;
+    // left in place so historical rows stay intact, scheduled for removal in
+    // a dedicated future migration.
 
     // One row per paginated, ?updated_since=-capable catalog endpoint (products,
     // cars) — deliberately NOT used for branches/brands, which the contract
@@ -799,49 +787,43 @@ const initializeDatabase = async (loadMockData = false) => {
       ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
     `);
 
-    // products.brand_id: the real FK a synced product needs (EasyGas's own
-    // products carry a product_brand_id, not a name string). The existing
-    // free-text `brand` column is NOT replaced or deprecated — every synced
-    // upsert writes brand_id AND denormalizes brands.name into `brand` in the
-    // same statement (see easyGasCatalogSyncService.js), because
-    // productRepository.search/getDistinctBrands and resolveEquipment's
-    // derived product_name all read the free-text column today; skipping the
-    // dual-write would make every EasyGas-sourced product silently invisible
-    // in the exact UI installers use to find equipment.
+    // products.brand_id: the real FK a product needs to its local brand.
+    // The existing free-text `brand` column is NOT replaced or deprecated —
+    // productRepository.create/update denormalizes brands.name into `brand`
+    // in the same statement, because productRepository.search/
+    // getDistinctBrands and resolveEquipment's derived product_name all read
+    // the free-text column today; skipping the dual-write would make a
+    // product silently invisible in the exact UI installers use to find
+    // equipment.
     await ensureColumn(
       connection, 'products', 'brand_id',
       'brand_id INT NULL AFTER brand, ADD CONSTRAINT fk_products_brand FOREIGN KEY (brand_id) REFERENCES brands(id)'
     );
 
     // warranty_forms.car_id: nullable — free-text vehicle_name fallback stays
-    // valid when no catalog match exists (decision 3 of the approved plan).
+    // valid when no catalog match exists.
     await ensureColumn(
       connection, 'warranty_forms', 'car_id',
       'car_id INT NULL AFTER vehicle_name, ADD CONSTRAINT fk_warranty_forms_car FOREIGN KEY (car_id) REFERENCES cars(id)'
     );
 
-    // branches.easygas_stag_code: the real EasyGas STAG-format branch code
-    // (e.g. "01/1") needed for buildPayload's branch_stag_code field (see
-    // easyGasSyncService.js) — genuinely distinct from branches.code (this
-    // app's own internal identifier, e.g. "BR001"). Nullable and left
-    // unpopulated by any code path here: no /branches sync is wired to
-    // auto-populate it (see easyGasCatalogClient.getBranches) — it's a
-    // manual, ops-entered value per branch, filled in outside this codebase.
+    // DEPRECATED (EasyGas integration removed) — branches.easygas_stag_code is
+    // no longer read or written by any application code; left in place so
+    // historical rows stay intact, scheduled for removal in a dedicated
+    // future migration.
     await ensureColumn(connection, 'branches', 'easygas_stag_code', 'easygas_stag_code VARCHAR(20) NULL AFTER code');
 
-    // cars.is_active: mirrors products.is_active's existing pattern —
-    // EasyGas's catalog has no soft-deletes, so a deleted car can only be
-    // noticed by a full-catalog sync finding it missing (see
-    // easyGasCatalogSyncService.js's syncCars). Never hard-delete a car row:
-    // warranty_forms.car_id has a real FK to it, and a historical warranty
-    // must keep resolving correctly even after the car leaves EasyGas's
-    // active catalog.
+    // cars.is_active: same soft-disable convention as products/brands/
+    // branches — never hard-delete a car row: warranty_forms.car_id has a
+    // real FK to it, and a historical warranty must keep resolving correctly
+    // even after a car is retired from the active catalog (deactivate it
+    // instead, same as productController.setProductActive).
     await ensureColumn(connection, 'cars', 'is_active', 'is_active BOOLEAN NOT NULL DEFAULT TRUE AFTER model');
 
     // ── Inventory module (Phase 1) ───────────────────────────────────────────
-    // Physical-unit tracking on top of the EasyGas-synced products catalog.
-    // products stays sync-only (see products-architecture memory) — these
-    // tables extend it, never write to it. Creation order matters: batches
+    // Physical-unit tracking on top of the products catalog. products stays a
+    // pure admin-managed catalog — these tables extend it, never write to it.
+    // Creation order matters: batches
     // before items (items.import_batch_id references it), items before
     // status_history (history.inventory_item_id references it).
     await connection.execute(`
@@ -925,7 +907,7 @@ const initializeDatabase = async (loadMockData = false) => {
 
     // Current point value per product. Absence of a row means 0 (unconfigured),
     // not a special NULL state — avoids a backfill migration touching every
-    // EasyGas-synced product. is_active gate/products.category etc. are all
+    // existing product. is_active gate/products.category etc. are all
     // read from `products` directly; this table only ever holds the point value.
     // product_id FK is RESTRICT, not CASCADE: a product with a configured
     // point value is real, meaningful data — deleting the product must not
@@ -982,9 +964,8 @@ const initializeDatabase = async (loadMockData = false) => {
     // this, a typed cylinder always earns 0 points (product_point_configs is
     // keyed by product_id, which a typed cylinder never has), which
     // incentivizes an installer to falsely pick a catalog product instead of
-    // accurately reporting an off-catalog one — flagged by EasyGas, since a
-    // wrong product recorded here also corrupts their own fuel cross-check.
-    // Keyed by equipment_type (not a sentinel product_id) so it can never be
+    // accurately reporting an off-catalog one. Keyed by equipment_type (not a
+    // sentinel product_id) so it can never be
     // confused with a real product's config. The other 3 enum values will
     // realistically never have a row — kept in the ENUM only for consistency
     // with every other equipment_type column in this schema.
@@ -1111,12 +1092,11 @@ const initializeDatabase = async (loadMockData = false) => {
     await ensureIndexAdded(connection, 'warranty_forms', 'idx_warranty_forms_installation_date', '(installation_date)');
     await ensureIndexAdded(connection, 'point_transactions', 'idx_point_transactions_created_at', '(created_at)');
 
-    // ── Typed cylinder support (EasyGas open cylinder input) ────────────────
-    // EasyGas's catalog only carries 2 CNG cylinder models — not enough for
-    // what installers actually fit — so a cylinder may now be entered as
-    // free text (brand_name + model/capacity) instead of a catalog
-    // product_id. The other 3 equipment types are unaffected and still
-    // always require one.
+    // ── Typed cylinder support (open cylinder input) ────────────────────────
+    // The local catalog can never carry every real-world cylinder in the
+    // field, so a cylinder may be entered as free text (brand_name +
+    // model/capacity) instead of a catalog product_id. The other 3
+    // equipment types are unaffected and still always require one.
     await ensureNullableColumn(connection, 'warranty_equipment', 'product_id', 'product_id INT NULL');
     await ensureColumn(connection, 'warranty_equipment', 'brand_name', 'brand_name VARCHAR(150) NULL AFTER serial_number');
     await ensureColumn(connection, 'warranty_equipment', 'model', 'model VARCHAR(100) NULL AFTER brand_name');
@@ -1216,17 +1196,15 @@ const initializeDatabase = async (loadMockData = false) => {
 
     // Runs after mock-data seeding (if any) so it always sees the final set
     // of branch_code values, whether real historical data or freshly-seeded
-    // dev data — see backfillBranches/seedPlaceholderBranches above.
-    // Must run before cleanupAccidentalAdminBranches (and before the EasyGas
-    // sync sweep's own branches.code join ever fires) — see
-    // ensureColumnCollation's header comment for the real incident this fixes.
+    // dev data — see backfillBranches/seedPlaceholderBranches above. Must
+    // run before cleanupAccidentalAdminBranches — see ensureColumnCollation's
+    // header comment for the real incident this fixes.
     await ensureColumnCollation(connection, 'warranty_forms', 'installer_branch_code', 'installer_branch_code VARCHAR(100) NULL COLLATE utf8mb4_unicode_ci');
     await backfillBranches(connection);
     await cleanupAccidentalAdminBranches(connection);
     await seedPlaceholderBranches(connection);
     await migrateWarrantyFormProducts(connection);
     await backfillWarrantyFuelType(connection);
-    await backfillEasyGasSkipLegacyWarranties(connection);
 
     console.log('[DB] Database initialization complete');
   } catch (error) {

@@ -9,7 +9,7 @@
  * request via the X-Language header (see ezone/src/api/client.js's request
  * interceptor) — no export call site hardcodes a language.
  *
- * Enum value dictionaries (categories/inventoryStatuses/syncStatuses/
+ * Enum value dictionaries (categories/inventoryStatuses/
  * transactionTypes) use the exact same translated strings as their frontend
  * counterparts (statusBadge.js, LanguageContext.jsx) so a status reads
  * identically whether seen in the UI or in an exported file.
@@ -25,11 +25,10 @@ const LABELS = {
       createdAt: 'Yaratilgan sana', updatedAt: 'Yangilangan sana',
       employee: 'Xodim', ownerName: 'Egasi ismi', ownerPhone: 'Egasi telefoni', vehicle: 'Avtomobil',
       plateNumber: 'Davlat raqami', vin: 'VIN', fuelType: "Yoqilg'i turi", installationDate: "O'rnatish sanasi",
-      easygasSyncStatus: 'EasyGas holati', easygasWarrantyNumber: 'EasyGas kafolat raqami',
+      warrantyBookNumber: 'Kafolat raqami',
       installer: "O'rnatuvchi", points: 'Ball', type: 'Tur', product: 'Mahsulot', reason: 'Sabab',
       metric: "Ko'rsatkich", value: 'Qiymat',
-      totalWarranties: 'Jami kafolatlar', successfulInstalls: "Muvaffaqiyatli o'rnatishlar",
-      rejectedInstalls: 'Rad etilgan o\'rnatishlar', lifetimePoints: 'Umrbod ballar',
+      totalWarranties: 'Jami kafolatlar', lifetimePoints: 'Umrbod ballar',
       imported: 'Import qilindi', installed: "O'rnatildi", remainingStock: 'Qolgan zaxira',
       failureRate: 'Nosozlik darajasi %', returnRate: 'Qaytarish darajasi %',
       warehouse: 'Ombor', total: 'Jami', currentStock: 'Joriy zaxira', installedStock: "O'rnatilgan zaxira",
@@ -48,7 +47,6 @@ const LABELS = {
       DAMAGED: 'Shikastlangan', LOST: "Yo'qolgan", MERGED: 'Birlashtirilgan',
     },
     fuelTypes: { LPG: 'LPG', CNG: 'CNG' },
-    syncStatuses: { PENDING: 'Navbatda', SYNCING: 'Yuborilmoqda', SYNCED: 'Sinxronlangan', FAILED: 'Muvaffaqiyatsiz' },
     transactionTypes: {
       WARRANTY_AWARD: 'Kafolat uchun ball', WARRANTY_REVERSAL: 'Ball qaytarildi',
       MANUAL_ADJUSTMENT: "Qo'lda tuzatish", MANUAL_BONUS: 'Bonus', MANUAL_PENALTY: 'Jarima',
@@ -58,7 +56,6 @@ const LABELS = {
       availableInventory: 'Mavjud zaxira', damagedInventory: 'Shikastlangan zaxira', lostInventory: "Yo'qolgan zaxira",
       returnedInventory: 'Qaytarilgan zaxira', importedToday: 'Bugun import qilindi',
       importedThisMonth: 'Shu oy import qilindi', warrantyCount: 'Kafolatlar soni',
-      warrantySuccessRate: 'Kafolat muvaffaqiyat foizi',
     },
     locale: 'uz-UZ',
   },
@@ -69,11 +66,10 @@ const LABELS = {
       createdAt: 'Дата создания', updatedAt: 'Дата обновления',
       employee: 'Сотрудник', ownerName: 'Имя владельца', ownerPhone: 'Телефон владельца', vehicle: 'Автомобиль',
       plateNumber: 'Гос. номер', vin: 'VIN', fuelType: 'Тип топлива', installationDate: 'Дата установки',
-      easygasSyncStatus: 'Статус EasyGas', easygasWarrantyNumber: 'Номер гарантии EasyGas',
+      warrantyBookNumber: 'Номер гарантии',
       installer: 'Установщик', points: 'Баллы', type: 'Тип', product: 'Продукт', reason: 'Причина',
       metric: 'Показатель', value: 'Значение',
-      totalWarranties: 'Всего гарантий', successfulInstalls: 'Успешные установки',
-      rejectedInstalls: 'Отклонённые установки', lifetimePoints: 'Баллы за всё время',
+      totalWarranties: 'Всего гарантий', lifetimePoints: 'Баллы за всё время',
       imported: 'Импортировано', installed: 'Установлено', remainingStock: 'Остаток на складе',
       failureRate: 'Процент отказов %', returnRate: 'Процент возвратов %',
       warehouse: 'Склад', total: 'Всего', currentStock: 'Текущий запас', installedStock: 'Установленный запас',
@@ -92,7 +88,6 @@ const LABELS = {
       DAMAGED: 'Повреждён', LOST: 'Утерян', MERGED: 'Объединён',
     },
     fuelTypes: { LPG: 'LPG', CNG: 'CNG' },
-    syncStatuses: { PENDING: 'В очереди', SYNCING: 'Отправляется', SYNCED: 'Синхронизировано', FAILED: 'Ошибка' },
     transactionTypes: {
       WARRANTY_AWARD: 'Баллы за гарантию', WARRANTY_REVERSAL: 'Баллы возвращены',
       MANUAL_ADJUSTMENT: 'Ручная корректировка', MANUAL_BONUS: 'Бонус', MANUAL_PENALTY: 'Штраф',
@@ -102,7 +97,6 @@ const LABELS = {
       availableInventory: 'Доступные запасы', damagedInventory: 'Повреждённые запасы', lostInventory: 'Утерянные запасы',
       returnedInventory: 'Возвращённые запасы', importedToday: 'Импортировано сегодня',
       importedThisMonth: 'Импортировано в этом месяце', warrantyCount: 'Количество гарантий',
-      warrantySuccessRate: 'Процент успешных гарантий',
     },
     locale: 'ru-RU',
   },

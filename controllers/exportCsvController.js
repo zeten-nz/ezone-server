@@ -62,10 +62,12 @@ const exportWarranty = async (req, res, next) => {
   try {
     const language = resolveLanguage(req);
     const labels = getLabels(language);
-    // Optional installer scope, same as the paginated list endpoint — lets
-    // "export filtered results" work from an installer drill-down without a
-    // separate export path.
+    // Same optional filters as the paginated list endpoint (getAllWarrantyForms)
+    // — lets "export filtered results" actually export what's filtered,
+    // instead of silently dumping the whole table.
     const employeeId = req.query.employeeId ? parseInt(req.query.employeeId, 10) : undefined;
+    const search = (req.query.search || '').trim() || undefined;
+    const verificationStatus = req.query.verificationStatus || undefined;
     connection = await pool.getConnection();
     await streamRowsAsCsv(res, {
       filename: `warranty_${dateStamp()}.csv`,
@@ -79,11 +81,10 @@ const exportWarranty = async (req, res, next) => {
         { header: labels.columns.vin, value: (r) => r.vehicle_vin },
         { header: labels.columns.fuelType, value: (r) => translateEnum(labels.fuelTypes, r.fuel_type) },
         { header: labels.columns.installationDate, value: (r) => formatCsvDate(r.installation_date, language, false) },
-        { header: labels.columns.easygasSyncStatus, value: (r) => translateEnum(labels.syncStatuses, r.easygas_sync_status) },
-        { header: labels.columns.easygasWarrantyNumber, value: (r) => r.easygas_warranty_number },
+        { header: labels.columns.warrantyBookNumber, value: (r) => r.warranty_book_number },
         { header: labels.columns.createdAt, value: (r) => formatCsvDate(r.created_at, language, true) },
       ],
-      fetchChunk: (lastId, limit) => warrantyRepository.findChunkForExport(connection, { lastId, limit, employeeId }),
+      fetchChunk: (lastId, limit) => warrantyRepository.findChunkForExport(connection, { lastId, limit, employeeId, search, verificationStatus }),
     });
   } catch (error) {
     if (!res.headersSent) return next(error);
@@ -150,7 +151,6 @@ const exportReports = async (req, res, next) => {
         { metric: labels.metrics.importedToday, value: totals.importedToday },
         { metric: labels.metrics.importedThisMonth, value: totals.importedThisMonth },
         { metric: labels.metrics.warrantyCount, value: totals.warrantyCount },
-        { metric: labels.metrics.warrantySuccessRate, value: totals.warrantySuccessRate != null ? (totals.warrantySuccessRate * 100).toFixed(1) : labels.notAvailable },
       ],
     });
   } catch (error) {
@@ -177,8 +177,6 @@ const exportInstallerStatistics = async (req, res, next) => {
       columns: [
         { header: labels.columns.installer, value: (r) => r.full_name },
         { header: labels.columns.totalWarranties, value: (r) => r.totalWarranties },
-        { header: labels.columns.successfulInstalls, value: (r) => r.successfulInstalls },
-        { header: labels.columns.rejectedInstalls, value: (r) => r.rejectedInstalls },
         { header: labels.columns.lifetimePoints, value: (r) => r.lifetimePoints },
       ],
       rows,

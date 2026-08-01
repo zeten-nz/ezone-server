@@ -201,20 +201,6 @@ const getDashboardTotalsData = async (connection) => {
     .filter((r) => r.status !== 'MERGED')
     .reduce((sum, r) => sum + Number(r.count), 0);
 
-  // Success % excludes legacy pre-EasyGas warranties (submission_uuid IS
-  // NULL, bulk-marked FAILED by a one-time backfill that never represented
-  // a real attempted sync) — including them would permanently and
-  // misleadingly deflate the metric with historical data, not real
-  // installer/sync performance (Critical Review #3).
-  const [[syncCounts]] = await connection.execute(
-    `SELECT
-       SUM(CASE WHEN easygas_sync_status = 'SYNCED' THEN 1 ELSE 0 END) AS synced,
-       SUM(CASE WHEN easygas_sync_status = 'FAILED' AND easygas_sync_terminal = TRUE THEN 1 ELSE 0 END) AS failed
-     FROM warranty_forms WHERE submission_uuid IS NOT NULL`
-  );
-  const attempted = Number(syncCounts.synced || 0) + Number(syncCounts.failed || 0);
-  const successRate = attempted > 0 ? Number(syncCounts.synced) / attempted : null;
-
   return {
     totalProducts,
     totalInventory,
@@ -226,7 +212,6 @@ const getDashboardTotalsData = async (connection) => {
     importedToday: importedCounts.today,
     importedThisMonth: importedCounts.thisMonth,
     warrantyCount: totalWarranties,
-    warrantySuccessRate: successRate,
   };
 };
 
@@ -299,7 +284,7 @@ const getRecentWarrantyActivity = async (req, res, next) => {
     const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 10));
     const connection = await pool.getConnection();
     const [rows] = await connection.execute(
-      `SELECT wf.id, wf.owner_full_name, wf.vehicle_name, wf.installation_date, wf.easygas_sync_status,
+      `SELECT wf.id, wf.owner_full_name, wf.vehicle_name, wf.installation_date,
               wf.created_at, u.full_name AS employee_name
        FROM warranty_forms wf
        JOIN users u ON u.id = wf.employee_id
@@ -328,18 +313,16 @@ const getRecentInventoryActivity = async (req, res, next) => {
 /**
  * Shared by both the admin drill-down (getInstallerStatistics) and the
  * self-service endpoint (getMyStatistics) — mirrors pointsService's
- * getInstallerLedger reuse pattern from Phase 3. "Successful"/"Rejected"
- * installs map onto EasyGas sync outcome (the only real signal that exists
- * — see Critical Review #3), excluding legacy pre-integration rows from
- * both counts entirely, same reasoning as the dashboard's success rate.
+ * getInstallerLedger reuse pattern from Phase 3. A warranty is simply a
+ * successfully created local EZONE warranty — there is no external
+ * validation step anymore, so totalWarranties alone is the complete count;
+ * nothing is classified as "rejected" at the warranty level (a per-equipment
+ * Manual Verification rejection already excludes that one row from
+ * topInstalledProducts below, without invalidating the whole warranty).
  */
 const getInstallerStatisticsData = async (connection, installerId) => {
   const [[counts]] = await connection.execute(
-    `SELECT
-       COUNT(*) AS totalWarranties,
-       SUM(CASE WHEN submission_uuid IS NOT NULL AND easygas_sync_status = 'SYNCED' THEN 1 ELSE 0 END) AS successfulInstalls,
-       SUM(CASE WHEN submission_uuid IS NOT NULL AND easygas_sync_status = 'FAILED' AND easygas_sync_terminal = TRUE THEN 1 ELSE 0 END) AS rejectedInstalls
-     FROM warranty_forms WHERE employee_id = ?`,
+    `SELECT COUNT(*) AS totalWarranties FROM warranty_forms WHERE employee_id = ?`,
     [installerId]
   );
   const [[claimed]] = await connection.execute(
@@ -375,8 +358,7 @@ const getInstallerStatisticsData = async (connection, installerId) => {
 
   // mysql2 returns SUM()/COALESCE(SUM()...) results as strings (MySQL's
   // wire protocol types them DECIMAL, not INT) — coerce to real numbers so
-  // this API's numeric fields are consistently typed, matching
-  // successfulInstalls/rejectedInstalls above.
+  // this API's numeric fields are consistently typed.
   const [lifetimePoints, monthlyPoints] = await Promise.all([
     pointTransactionRepository.getInstallerTotal(connection, installerId),
     pointTransactionRepository.getMonthlyTotal(connection, installerId),
@@ -387,8 +369,6 @@ const getInstallerStatisticsData = async (connection, installerId) => {
   return {
     totalWarranties: counts.totalWarranties,
     totalClaimedInventory: claimed.totalClaimedInventory,
-    successfulInstalls: Number(counts.successfulInstalls) || 0,
-    rejectedInstalls: Number(counts.rejectedInstalls) || 0,
     currentPoints: lifetimePointsNum,
     lifetimePoints: lifetimePointsNum,
     monthlyPoints: monthlyPointsNum,
@@ -455,10 +435,7 @@ const getProductStatistics = async (req, res, next) => {
  */
 const getAllInstallersStatisticsData = async (connection) => {
   const [warrantyRows] = await connection.execute(
-    `SELECT u.id, u.full_name,
-            COUNT(wf.id) AS totalWarranties,
-            SUM(CASE WHEN wf.submission_uuid IS NOT NULL AND wf.easygas_sync_status = 'SYNCED' THEN 1 ELSE 0 END) AS successfulInstalls,
-            SUM(CASE WHEN wf.submission_uuid IS NOT NULL AND wf.easygas_sync_status = 'FAILED' AND wf.easygas_sync_terminal = TRUE THEN 1 ELSE 0 END) AS rejectedInstalls
+    `SELECT u.id, u.full_name, COUNT(wf.id) AS totalWarranties
      FROM users u
      LEFT JOIN warranty_forms wf ON wf.employee_id = u.id
      WHERE u.role = 'EMPLOYEE'
@@ -472,8 +449,6 @@ const getAllInstallersStatisticsData = async (connection) => {
     id: r.id,
     full_name: r.full_name,
     totalWarranties: r.totalWarranties,
-    successfulInstalls: Number(r.successfulInstalls) || 0,
-    rejectedInstalls: Number(r.rejectedInstalls) || 0,
     lifetimePoints: pointsByInstaller.get(r.id) ?? 0,
   }));
 };

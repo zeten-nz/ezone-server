@@ -6,25 +6,22 @@ This is a factual ledger — what's done, what's dormant, what's broken, what's 
 
 ## Completed &amp; Live
 
-Warranty submission/edit/delete with atomic inventory claiming (including a typed, catalog-optional cylinder as of this session), the full inventory CSV-import + manual-correction toolchain, the automatic points-award/reversal ledger with manual Super-Admin adjustments, the full reporting/statistics surface, and EasyGas warranty-push + catalog-pull sync with crash recovery are all real, working, and exercised end to end — with the specific exception of a real successful (`2xx`) warranty push, which has never yet been observed (every live test to date used synthetic data deliberately expected to be rejected).
+Warranty submission/edit/delete with atomic inventory claiming (including a typed, catalog-optional cylinder), the full inventory CSV-import + manual-correction toolchain, the automatic points-award/reversal ledger with manual Super-Admin adjustments, and the full reporting/statistics surface are all real, working, and exercised end to end. Warranty creation is fully local and synchronous — a warranty number is assigned sequentially (`W-YYYY-NNNNNN`) inside the same transaction that creates the row, with no external dependency of any kind.
 
-Newly shipped this session, all confirmed working via direct testing, not just written:
-- The EasyGas catalog client now signs every request (previously unsigned/public) and shares the warranty push's base URL and secret.
-- A real pagination bug that silently capped every catalog sync at page 1 is fixed and confirmed (full 179-product/409-car pulls now succeed).
-- Catalog deletion detection (deactivate on a full sync's absence) and reactivation-on-reappear, for both products and cars.
-- The catalog sweep is now gated to a single PM2 worker, closing a real amplification concern against EasyGas's API.
-- A typed (free-text) cylinder — brand/model instead of a catalog pick — end to end: schema, service-layer resolution, inventory/points side-effects correctly skipped, and outbound payload shape.
-- Idempotent warranty creation — a retried `POST` with the same `submission_uuid` returns the existing form instead of a raw duplicate-key error.
-- An admin-only live lookup of EasyGas's real branch codes (`GET /api/branches/easygas`), and a `branches.easygas_stag_code` field to store the result.
-- Explicit 401/403 → retryable classification in the warranty-push retry logic.
+**The previously-integrated third-party warranty-sync/catalog-sync platform has been fully and permanently removed.** What that means concretely:
+- No more sync status — a warranty is simply created once its row exists in `warranty_forms`; there's no PENDING/SYNCING/SYNCED/FAILED lifecycle, no retry, no sync sweep, no background jobs. Reports/statistics/dashboards read local warranty data only.
+- Brands and cars are now local ERP master data with full admin CRUD (`brandRepository.js`/`brandController.js`/`brandRoutes.js` at `/api/brands`; `carRepository.js`/`carController.js`/`carRoutes.js` at `/api/cars`, plus the pre-existing `/api/cars/search`), not externally-synced catalogs. `products.brand_id` is a real FK to `brands.id`.
+- Warranty numbers are generated locally and sequentially (`getNextWarrantyNumber`, `warrantyRepository.js`) — e.g. `W-2026-000001` — via a `warranty_number_sequences` table, atomically inside `createWarrantyForm`'s transaction.
+- Idempotent warranty creation is retained — a retried `POST` with the same `submission_uuid` returns the existing form instead of a raw duplicate-key error.
+- A set of deprecated legacy columns from the old integration (sync-tracking fields on `warranty_forms`, a STAG-branch-code field on `branches`, and `external_id`/`synced_at`/`external_updated_at` on `products`/`brands`/`cars`) still physically exist in the database — Phase 1 of a two-phase removal — but are no longer read or written by any code path. A future Phase 2 migration will drop them once everything is verified. See [03-database.md](03-database.md).
 
 ## Unfinished / Dormant
 
 Stated explicitly in the code's own comments, not inferred:
 
-- An entire external STAG **equipment-validation** API integration (distinct from the catalog/warranty-push integration documented in [07-easygas-integration.md](07-easygas-integration.md)) — `warranty_equipment`'s `equipment_validation_status`, `validated_at`, `reward_points`, `reward_transaction_id`, `validation_response` columns are schema-ready but never populated by any code path.
+- An entire external STAG **equipment-validation** API integration (a separate, still-unbuilt integration, distinct from the removed catalog/warranty-sync integration) — `warranty_equipment`'s `equipment_validation_status`, `validated_at`, `reward_points`, `reward_transaction_id`, `validation_response` columns are schema-ready but never populated by any code path.
 - `warranty_form_products`, `warranty_forms`' original per-equipment flat columns, `vehicle_brand`/`vehicle_model`, `products.score`, `products.status` — all fully superseded, kept only so historical rows keep rendering or because migrations never drop columns.
-- No "warranty validity" (active/expired/cancelled) concept exists anywhere, despite EasyGas's response already carrying `term_months`/`expires_at`/`status` on every successful push.
+- No "warranty validity" (active/expired/cancelled) concept exists anywhere in this schema — it never has, independent of the (now-removed) third-party integration.
 
 ## Confirmed Broken
 
@@ -32,22 +29,17 @@ Stated explicitly in the code's own comments, not inferred:
 
 ## Implemented But Currently Unreachable
 
-New category this session, worth calling out on its own:
-
 - **The typed-cylinder backend capability has no frontend to use it.** The form still hard-requires a catalog product for all 4 equipment types. See [05-frontend.md](05-frontend.md).
-- **`branches.easygas_stag_code` has an API but no UI.** An admin can look up the real value (`GET /api/branches/easygas`) and set it (`PUT /api/branches/:branchId`), but only by calling the API directly — no form field exists yet.
 
 ## Known Limitations, Stated Directly
 
 - No JWT refresh/revocation mechanism exists.
-- There is no "warranty validity" concept anywhere — only sync status exists.
+- There is no "warranty validity" concept anywhere — a warranty is simply created; nothing tracks active/expired/cancelled state.
 - Four of the seven `inventory_items` statuses (`RESERVED`, `RETURNED`, `DAMAGED`, `LOST`) have no automatic trigger — manual admin actions only.
-- No incremental EasyGas catalog sync exists or is planned to be added — a deliberate choice, not a gap (see [07-easygas-integration.md](07-easygas-integration.md)).
-- The frontend's EasyGas error-code translation dictionary is behind the backend's by 6 codes.
 - No automated test suite exists anywhere in either repository — confirmed directly (no test files, no test runner dependency, no `test` script) in both a fresh backend and frontend audit this session.
 
 ## Code Quality Review
 
-See [12-architecture-review.md](12-architecture-review.md) for the full, critical version. Short version: maintainability is high in the domains that received the most iteration (warranty, inventory, points, EasyGas sync) — real transaction discipline, one proven atomic-guard idiom reused everywhere, additive-only migrations with zero exceptions found, and an unusually high proportion of self-documenting comments explaining *why*, not just what. It's lower in domains touched less recently (`userController.js` bypasses the service/repository layers entirely) — a recognizable shape for a system that grew in phases, evidenced directly rather than assumed.
+See [12-architecture-review.md](12-architecture-review.md) for the full, critical version. Short version: maintainability is high in the domains that received the most iteration (warranty, inventory, points) — real transaction discipline, one proven atomic-guard idiom reused everywhere, additive-only migrations with zero exceptions found, and an unusually high proportion of self-documenting comments explaining *why*, not just what. It's lower in domains touched less recently (`userController.js` bypasses the service/repository layers entirely) — a recognizable shape for a system that grew in phases, evidenced directly rather than assumed.
 
-**Recommendation for anyone extending this codebase**: read `services/warrantyService.js` and `services/easyGasSyncService.js` first — between them they show both the intended architectural pattern and the most recently-exercised discipline of confirming an external contract empirically rather than trusting a document. Treat `userController.js` as an outlier, not an alternative style.
+**Recommendation for anyone extending this codebase**: read `services/warrantyService.js` first — it shows both the intended architectural pattern (transaction boundary, atomic inventory claim, points award, local sequential warranty numbering) and the general code quality bar the rest of the codebase should be held to. Treat `userController.js` as an outlier, not an alternative style.

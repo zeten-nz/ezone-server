@@ -3,7 +3,6 @@ const { body } = require('express-validator');
 const {
   getAllBranches,
   getPublicBranches,
-  getEasyGasBranches,
   createBranch,
   updateBranch,
   disableBranch,
@@ -20,23 +19,14 @@ router.get('/public', getPublicBranches);
 router.use(verifyToken, authorizeRole('ADMIN'));
 
 router.get('/', getAllBranches);
-router.get('/easygas', getEasyGasBranches);
-
-const stagCodeValidation = body('easygas_stag_code')
-  .optional({ nullable: true })
-  .trim()
-  .isLength({ max: 20 })
-  .withMessage('EasyGas STAG code must be 20 characters or fewer');
 
 router.post('/', [
   body('code').trim().notEmpty().withMessage('Branch code is required'),
   body('name').trim().notEmpty().withMessage('Branch name is required'),
-  stagCodeValidation,
 ], createBranch);
 
 router.put('/:branchId', [
   body('name').trim().notEmpty().withMessage('Branch name is required'),
-  stagCodeValidation,
 ], updateBranch);
 
 router.patch('/:branchId/disable', disableBranch);

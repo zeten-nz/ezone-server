@@ -1,6 +1,6 @@
 /**
  * Extracts the barcode column from a real-world CSV/TXT inventory import
- * file — Excel/LibreOffice/EasyGas exports (BOM, CRLF, quoted, delimited,
+ * file — Excel/LibreOffice-style exports (BOM, CRLF, quoted, delimited,
  * multi-column) and the original bare one-barcode-per-line TXT format both
  * go through this same path. Pure parsing/column-detection only: barcode
  * *value* validity (character-set rules) stays entirely in

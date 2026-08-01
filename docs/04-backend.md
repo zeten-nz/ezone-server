@@ -59,7 +59,7 @@ Expiry only (`JWT_EXPIRE`, default 7 days). **No refresh, rotation, or server-si
 
 ### `utils/` and `dtos/`
 
-`utils/` holds cross-cutting helpers: `AppError.js`, `csvBarcodeParser.js`, `csvStream.js`, `vehicleName.js`, `warrantyEquipment.js`, plus two added this session — `phoneFormat.js` (best-effort `+998` canonicalization before an EasyGas push) and `easyGasSigning.js` (HMAC signing, shared by both the warranty and catalog EasyGas clients — previously duplicated/private to one client). `dtos/` contains exactly one file, `warrantyDTO.js`, used only by `warrantyController.js`.
+`utils/` holds cross-cutting helpers: `AppError.js`, `csvBarcodeParser.js`, `csvStream.js`, `vehicleName.js`, `warrantyEquipment.js`, `phoneFormat.js` (best-effort `+998` phone-number canonicalization). `dtos/` contains exactly one file, `warrantyDTO.js`, used only by `warrantyController.js`.
 
 ---
 
@@ -71,19 +71,15 @@ Expiry only (`JWT_EXPIRE`, default 7 days). **No refresh, rotation, or server-si
 
 **Idempotent create, added this session**: before any expensive work, `createWarrantyForm` checks whether `submission_uuid` already has a warranty (`warrantyRepository.findBySubmissionUuid`) — a retried POST (e.g. after a client timeout) returns the existing form (`200`) instead of hitting a raw UNIQUE-constraint error. A second check after a lost INSERT race (two near-simultaneous retries) covers the narrow window between the pre-check and the insert.
 
-The whole thing is one transaction: insert `warranty_forms`, atomically claim each real (non-typed) equipment row's barcode from inventory (a lost race throws `BARCODE_CLAIM_FAILED` and rolls back everything, including earlier claims in the same loop), write the 4 `warranty_equipment` rows, award points per row (0 for a typed cylinder — there's no product to look up a point value for). After commit, the warranty sits `PENDING` — the EasyGas push is never awaited synchronously.
+The whole thing is one transaction: insert `warranty_forms` (including a locally-generated sequential warranty number via `getNextWarrantyNumber`), atomically claim each real (non-typed) equipment row's barcode from inventory (a lost race throws `BARCODE_CLAIM_FAILED` and rolls back everything, including earlier claims in the same loop), write the 4 `warranty_equipment` rows, award points per row (0 for a typed cylinder — there's no product to look up a point value for). Once the transaction commits, the warranty is complete — there is no pending state, no external push, and nothing further happens asynchronously.
 
 ### Editing
 
-Non-admins may edit **only their own form**, **only within 24 hours**; admins are unrestricted. A row lock (`SELECT ... FOR UPDATE`) serializes concurrent edits/deletes. Installer/branch snapshot fields, `submission_uuid`, `warranty_book_number`, and every `easygas_sync_*` column are **never touched by an edit**. Change-detection now also compares `brand_name`/`model` (not just `product_id`/`serial_number`), so a typed cylinder's text being edited is correctly caught; switching a row between a catalog product and typed text in either direction correctly releases/reclaims inventory and reverses/reawards points.
+Non-admins may edit **only their own form**, **only within 24 hours**; admins are unrestricted. A row lock (`SELECT ... FOR UPDATE`) serializes concurrent edits/deletes. Installer/branch snapshot fields, `submission_uuid`, and `warranty_book_number` are **never touched by an edit** (the deprecated legacy sync-tracking columns still physically exist on the table but are no longer read or written by any code path, edit included — see [03-database.md](03-database.md)). Change-detection now also compares `brand_name`/`model` (not just `product_id`/`serial_number`), so a typed cylinder's text being edited is correctly caught; switching a row between a catalog product and typed text in either direction correctly releases/reclaims inventory and reverses/reawards points.
 
 ### Status concepts
 
-`easygas_sync_status` (PENDING/SYNCING/SYNCED/FAILED) is the sync lifecycle; `easygas_sync_terminal` distinguishes a retryable FAILED from one needing admin action. **There is still no separate "warranty validity" status** (active/expired/cancelled) anywhere in this schema — EasyGas's response does carry `term_months`/`expires_at`/`status`, but nothing here stores or reads them yet.
-
-### Retry &amp; failure handling
-
-Only the background sweep ever pushes to EasyGas. See [07-easygas-integration.md](07-easygas-integration.md) for the full retry/classification detail (expanded significantly this session).
+There is no sync lifecycle — a warranty is simply **created** the moment its row exists in `warranty_forms`; there's no PENDING/SYNCING/SYNCED/FAILED status, no retry, and nothing to reconcile. **There is still no separate "warranty validity" status** (active/expired/cancelled) anywhere in this schema — that remains a genuine gap.
 
 ---
 
@@ -104,7 +100,7 @@ checked via `affectedRows === 1` — the one concurrency-safety idiom reused eve
 
 ### Manual admin operations (all Super-Admin-gated)
 
-`changeStatusManually`, `transferBranch`, `correctBarcode` (blocked on `INSTALLED` items — the EasyGas payload is built from a frozen serial copy), `mergeDuplicate` (only from `IN_STOCK`, atomic).
+`changeStatusManually`, `transferBranch`, `correctBarcode` (blocked on `INSTALLED` items — the serial number is already frozen into the warranty's equipment record at that point), `mergeDuplicate` (only from `IN_STOCK`, atomic).
 
 ### Stock lifecycle
 
@@ -124,17 +120,6 @@ Manual adjustments (Super-Admin-only): adjustment/bonus/penalty, sign-constraine
 
 ## Reporting
 
-All under `/api/reports`, ADMIN-gated except `/my-statistics`. Every count/sum is real SQL aggregation. See the auto-generated backend audit for the exact computation behind every endpoint if you need it — unchanged this session, not re-detailed here.
+All under `/api/reports`, ADMIN-gated except `/my-statistics`. Every count/sum is real SQL aggregation over local warranty data — no external source is ever consulted. See the auto-generated backend audit for the exact computation behind every endpoint if you need it — unchanged this session, not re-detailed here.
 
----
-
-## Background Jobs
-
-Exactly two recurring jobs. Both start in `server.js`'s `startServer()`, after `initializeDatabase()` and before `app.listen()`.
-
-| Job | Interval (env var, default) | Overlap protection | Error isolation |
-|---|---|---|---|
-| Warranty retry sweep | `EASYGAS_SYNC_INTERVAL_MS`, 30s | Atomic per-row claim (cluster-safe) | Per-row try/catch + outer `.catch()` |
-| Catalog sync sweep | `EASYGAS_CATALOG_SYNC_INTERVAL_MS`, 5min | **Gated to PM2 worker 0 only — added this session** (was previously "none, every worker pulls independently") | Same outer `.catch()` pattern |
-
-See [07-easygas-integration.md](07-easygas-integration.md) for full detail on what each sweep does — that file changed substantially this session and is the authoritative source for this integration, not this summary.
+There are no background jobs of any kind in this application — every piece of work (warranty creation, warranty numbering, inventory claim, points award) happens synchronously inside the request that triggers it.

@@ -45,9 +45,8 @@ Grouped by module. **Admin** = `verifyToken + authorizeRole('ADMIN')`. **Super A
 | PUT | `/:formId` | Any (owner + within 24h) / Admin unrestricted | Edit a form |
 | GET | `/:formId` | Admin | Full form detail |
 | DELETE | `/:formId` | Admin | Delete a form |
-| POST | `/:formId/retry-sync` | Admin | Reset a FAILED EasyGas sync back to PENDING (409 if not currently FAILED) |
 
-Equipment array: `equipment.*.product_id` is now **optional** (was required); required only for `REDUCER`/`CONTROLLER`/`INJECTOR_RAIL` and for a catalog-picked `CYLINDER`. New optional fields `equipment.*.model`/`equipment.*.brand_name` support a typed cylinder — see [07-easygas-integration.md](07-easygas-integration.md).
+Equipment array: `equipment.*.product_id` is optional; required only for `REDUCER`/`CONTROLLER`/`INJECTOR_RAIL` and for a catalog-picked `CYLINDER`. Optional fields `equipment.*.model`/`equipment.*.brand_name` support a typed (free-text) cylinder.
 
 ## Registration Requests — `/api/registration-requests` (all Admin)
 
@@ -59,9 +58,8 @@ Unchanged this session: list, detail, photo stream, approve, reject.
 |---|---|---|---|
 | GET | `/public` | Public | Registration form's branch picker |
 | GET | `/` | Admin | List all branches |
-| GET | `/easygas` | Admin | **New this session.** Live, uncached passthrough of EasyGas's real branch list (`{stag_code, name, region_id}`) — used to look up the right value to enter via `PUT /:branchId` |
-| POST | `/` | Admin | Create a branch (now also accepts `easygas_stag_code`) |
-| PUT | `/:branchId` | Admin | Update a branch (accepts `easygas_stag_code`; omitting the key preserves any existing value rather than clearing it) |
+| POST | `/` | Admin | Create a branch |
+| PUT | `/:branchId` | Admin | Update a branch |
 | PATCH | `/:branchId/disable` \| `/enable` | Admin | Activate toggle |
 
 ## Products — `/api/products`
@@ -72,9 +70,13 @@ Unchanged this session. `PRODUCT_CATEGORIES = ['REDUCER','CYLINDER','ECU','INJEC
 
 Unchanged this session — see [04-backend.md](04-backend.md) for the full list, all still accurate.
 
+## Brands — `/api/brands`
+
+Local ERP master data — full admin CRUD via `brandRepository.js`/`brandController.js`/`brandRoutes.js`: list, active-only list, create, update, activate/deactivate, delete — all Admin.
+
 ## Cars — `/api/cars`
 
-`GET /search` (any) — unchanged.
+Local ERP master data — full admin CRUD via `carRepository.js`/`carController.js`/`carRoutes.js`: list, active-only list, create, update, activate/deactivate, delete — all Admin. Plus `GET /search` (any role) — used by the warranty form's Vehicle Name autocomplete.
 
 ## Inventory — `/api/inventory`
 
@@ -90,7 +92,7 @@ Unchanged this session — 7 endpoints, 2 Super-Admin-only.
 
 ## Public Customer Lookup — **removed this session**
 
-`POST /api/public/customer/warranties` (`{ phone }` → that phone number's warranties) existed at one point and has been **deleted entirely** — controller, routes, the repository method backing it, and the `server.js` mount are all gone. It was confirmed to be an unauthenticated PII leak in production use, and no confirmed consumer needed it (EasyGas's own app was going to become the source of truth for customer-facing warranty status instead). See [09-security.md](09-security.md).
+`POST /api/public/customer/warranties` (`{ phone }` → that phone number's warranties) existed at one point and has been **deleted entirely** — controller, routes, the repository method backing it, and the `server.js` mount are all gone. It was confirmed to be an unauthenticated PII leak in production use, and no confirmed consumer needed it. See [09-security.md](09-security.md).
 
 ## Summary of every public (unauthenticated) endpoint — updated
 

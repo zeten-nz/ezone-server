@@ -71,47 +71,6 @@ const updateWarrantyForm = async (req, res, next) => {
 };
 
 /**
- * Manual admin retry for a warranty stuck in FAILED sync status — resets it
- * to PENDING so the next easyGasSyncSweep cycle picks it up again. Allowed
- * for terminal failures too (e.g. PRODUCT_NOT_MAPPED after an admin maps the
- * missing product) — see warrantyRepository.resetSyncStatus, which is the
- * actual enforcement point: it refuses the reset outright (regardless of
- * this or any future caller) while any equipment row is still PENDING or
- * REJECTED under Manual Verification. The extra lookup below only decides
- * which of two error messages to show — it grants no capability itself.
- */
-const retryWarrantySync = async (req, res, next) => {
-  let connection;
-  try {
-    const { formId } = req.params;
-    connection = await pool.getConnection();
-    const reset = await warrantyRepository.resetSyncStatus(connection, formId);
-    if (!reset) {
-      const blocked = await warrantyRepository.hasUnresolvedManualVerification(connection, formId);
-      if (blocked) {
-        return res.status(409).json({
-          success: false,
-          message: 'This warranty has an equipment item awaiting or rejected by Manual Verification — resolve it before retrying sync',
-          errorCode: 'MANUAL_VERIFICATION_UNRESOLVED',
-          timestamp: new Date().toISOString(),
-        });
-      }
-      return res.status(409).json({
-        success: false,
-        message: 'Warranty is not currently in a FAILED sync state',
-        errorCode: 'INVALID_STATE',
-        timestamp: new Date().toISOString(),
-      });
-    }
-    res.json({ message: 'Sync reset — will retry on the next sweep cycle' });
-  } catch (error) {
-    next(error);
-  } finally {
-    if (connection) connection.release();
-  }
-};
-
-/**
  * Manual Verification workflow — admin review actions, same shape as
  * registrationRequestController's approve/reject: read the service's typed
  * AppError (409 INVALID_STATE on a duplicate/already-reviewed request, 404
@@ -381,7 +340,6 @@ module.exports = {
   deleteWarrantyForm,
   searchWarrantyForms,
   getMyWarrantyForms,
-  retryWarrantySync,
   approveManualVerification,
   rejectManualVerification,
   uploadEquipmentPhoto,

@@ -82,7 +82,7 @@ const upsertMany = async (connection, warrantyFormId, equipmentRows) => {
  */
 const findById = async (connection, equipmentId) => {
   const [rows] = await connection.execute(
-    `SELECT we.*, p.brand AS product_brand, p.external_id AS product_external_id, p.category AS product_category
+    `SELECT we.*, p.brand AS product_brand, p.category AS product_category
      FROM warranty_equipment we
      LEFT JOIN products p ON p.id = we.product_id
      WHERE we.id = ?`,
@@ -115,20 +115,17 @@ const reviewVerification = async (connection, { equipmentId, decision, reviewedB
 // product_brand (joined, not stored on this table) lets the edit-warranty
 // form pre-select the Brand dropdown to match the already-chosen product —
 // without it, editing an existing warranty would show an empty Brand select
-// next to an already-populated Product field. product_external_id is
-// similarly joined-not-stored — the EasyGas sync (easyGasSyncService.js)
-// needs it to build a warranty's push payload, since EasyGas identifies
-// products by their own id, not ours. LEFT JOIN defensively, even though
-// product_id's FK is ON DELETE RESTRICT and should make this always resolve.
-// reviewed_by_name — same joined-not-stored treatment as product_brand
-// above, mirroring registration_requests' own reviewer_name join
-// (registrationRequestController.js) so the admin detail view can show who
-// reviewed a Manual Verification row without a separate lookup.
+// next to an already-populated Product field. LEFT JOIN defensively, even
+// though product_id's FK is ON DELETE RESTRICT and should make this always
+// resolve. reviewed_by_name — same joined-not-stored treatment as
+// product_brand above, mirroring registration_requests' own reviewer_name
+// join (registrationRequestController.js) so the admin detail view can show
+// who reviewed a Manual Verification row without a separate lookup.
 const findByWarrantyFormIds = async (connection, formIds) => {
   if (formIds.length === 0) return [];
   const placeholders = formIds.map(() => '?').join(',');
   const [rows] = await connection.execute(
-    `SELECT we.*, p.brand AS product_brand, p.external_id AS product_external_id, p.category AS product_category,
+    `SELECT we.*, p.brand AS product_brand, p.category AS product_category,
             ru.full_name AS reviewed_by_name
      FROM warranty_equipment we
      LEFT JOIN products p ON p.id = we.product_id

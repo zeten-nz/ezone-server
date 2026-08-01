@@ -2,11 +2,9 @@ const productRepository = require('../repositories/productRepository');
 
 /**
  * Public product-catalog interface consumed by controllers and
- * warrantyService. Backed by our own catalog table for now (see
- * productRepository) — a future implementation backed by the real external
- * STAG product API can replace the body of these functions without any
- * caller needing to change, since this interface (search/findById/create/
- * update/setActive) stays the same either way.
+ * warrantyService. Thin pass-through to productRepository — kept as its own
+ * layer so callers depend on a stable interface (search/findById/create/
+ * update/setActive) rather than the repository directly.
  */
 const search = (connection, options) => productRepository.search(connection, options);
 const getDistinctBrands = (connection, categories) => productRepository.getDistinctBrands(connection, categories);

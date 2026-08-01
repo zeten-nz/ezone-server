@@ -9,9 +9,8 @@
 - **SQL injection**: every user-supplied value goes through `?` placeholders; the only string-interpolated SQL is server-computed pagination/WHERE-clause scaffolding built from bound conditions.
 - **File uploads**: server-generated filenames only, extension/mimetype pre-filter plus real post-write magic-byte verification, 5MB cap.
 - **CSV export**: OWASP formula-injection mitigation, proper escaping, UTF-8 BOM, keyset pagination.
-- **Secrets**: no hardcoded secrets found anywhere; `JWT_SECRET` and `EASYGAS_SHARED_SECRET` are exclusively environment-sourced. A real EasyGas secret was received and stored this session, following this same convention — never logged, never committed (`.env` confirmed gitignored).
+- **Secrets**: no hardcoded secrets found anywhere; `JWT_SECRET` is exclusively environment-sourced — never logged, never committed (`.env` confirmed gitignored).
 - **JWT re-verification**: every request re-checks `is_active`/`role`/`is_super_admin` live against the database.
-- **HMAC-signed partner integration**: both directions of the EasyGas integration (warranty push and, as of this session, the catalog pull too) are signed with HMAC-SHA256 + a timestamp, confirmed working against the real live API.
 
 ## Gaps
 
@@ -20,7 +19,6 @@
 | No JWT revocation/blacklist | A leaked token is valid until its natural 7-day expiry regardless of logout (deactivating the account is the only immediate remedy) |
 | Coarse auth rate limiting | Register and login share one 10/15min budget |
 | CORS falls open for no-Origin requests | Deliberate accommodation for non-browser clients — mitigated entirely by JWT auth, not CORS |
-| Frontend error-code dictionary is behind the backend's | The 6 new terminal EasyGas error codes added this session aren't yet in the frontend's translation table — a display-only gap (admins see a generic message instead of a specific one), not a security issue, but worth fixing alongside the next frontend pass. See [05-frontend.md](05-frontend.md). |
 
 ## Resolved This Session: A Real, Live PII Leak
 

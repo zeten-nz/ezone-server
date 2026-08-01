@@ -8,7 +8,6 @@ const {
   deleteWarrantyForm,
   searchWarrantyForms,
   getMyWarrantyForms,
-  retryWarrantySync,
   approveManualVerification,
   rejectManualVerification,
   uploadEquipmentPhoto,
@@ -27,20 +26,15 @@ const router = express.Router();
 // employee's own branch/profile, not client input. vehicle_plate_number is
 // intentionally optional — many customers have no plate yet.
 //
-// vehicle_production_year/vehicle_mileage/installation_date ranges and
-// warranty_book_number's now-optional status mirror EasyGas's documented
-// integration limits exactly (see the EasyGas plan) — failing fast locally
-// avoids a pointless round trip just to get the same rejection back from
-// their sync a few seconds later.
 const currentYear = new Date().getFullYear();
 const warrantyValidationRules = [
-  // Installers no longer type a warranty number — EasyGas generates the
-  // official one, landed here by the sync sweep once it succeeds.
-  body('warranty_book_number').optional({ nullable: true, checkFalsy: true }),
   // Generated client-side once per warranty (crypto.randomUUID()) and
-  // reused across edits — this is the idempotency key EasyGas dedupes by,
-  // never regenerated on update. See WarrantyFormFields.jsx's
-  // createEmptyWarrantyForm().
+  // reused across edits — this is this warranty's create-idempotency key
+  // (protects against a client retrying a POST it doesn't know already
+  // succeeded), never regenerated on update. See WarrantyFormFields.jsx's
+  // createEmptyWarrantyForm(). warranty_book_number is deliberately not
+  // accepted from the client at all — it's assigned automatically at
+  // creation (see warrantyRepository.getNextWarrantyNumber).
   body('submission_uuid').notEmpty().isUUID().withMessage('A valid submission_uuid is required'),
   body('installation_date')
     .notEmpty()
@@ -59,9 +53,9 @@ const warrantyValidationRules = [
   // see the equipment redesign in config/database.js's fuel_type migration.
   body('fuel_type').notEmpty().isIn(['LPG', 'CNG']),
   body('vehicle_name').notEmpty(),
-  // Set only when the installer picked a match from the synced car catalog
+  // Set only when the installer picked a match from the local car catalog
   // autocomplete — free text (car_id absent/null) always remains valid, per
-  // the plan's catalog-first-with-free-text-fallback decision.
+  // the catalog-first-with-free-text-fallback decision.
   body('car_id').optional({ nullable: true }).isInt().withMessage('car_id must be an integer'),
   body('vehicle_production_year').isInt({ min: 1950, max: currentYear + 1 }).withMessage(`vehicle_production_year must be between 1950 and ${currentYear + 1}`),
   body('vehicle_plate_number').optional({ nullable: true, checkFalsy: true }),
@@ -114,12 +108,9 @@ router.put('/:formId',    verifyToken, warrantyValidationRules, updateWarrantyFo
 router.get('/:formId',    verifyToken, authorizeRole('ADMIN'), getWarrantyFormDetail);
 router.delete('/:formId', verifyToken, authorizeRole('ADMIN'), deleteWarrantyForm);
 
-// Manual retry for a warranty stuck in FAILED EasyGas sync status.
-router.post('/:formId/retry-sync', verifyToken, authorizeRole('ADMIN'), retryWarrantySync);
-
 // Manual Verification workflow — admin reviews one equipment row directly
 // (addressed by its own id, not by formId+type). ADMIN-only, same as every
-// other review/approval action in this app (registration requests, retry-sync).
+// other review/approval action in this app (registration requests).
 router.post('/equipment/:equipmentId/approve-verification', verifyToken, authorizeRole('ADMIN'), manualVerificationReviewRules, approveManualVerification);
 router.post('/equipment/:equipmentId/reject-verification', verifyToken, authorizeRole('ADMIN'), manualVerificationReviewRules, rejectManualVerification);
 

@@ -85,11 +85,17 @@ const createProduct = async (req, res, next) => {
     }
 
     const connection = await pool.getConnection();
-    await productService.create(connection, req.body);
-    connection.release();
+    try {
+      await productService.create(connection, req.body);
+    } finally {
+      connection.release();
+    }
 
     res.status(201).json({ message: 'Product created successfully' });
   } catch (error) {
+    if (error.errorCode === 'BRAND_NOT_FOUND') {
+      return res.status(400).json({ success: false, message: error.message, errorCode: error.errorCode, timestamp: new Date().toISOString() });
+    }
     next(error);
   }
 };
@@ -103,11 +109,17 @@ const updateProduct = async (req, res, next) => {
 
     const { productId } = req.params;
     const connection = await pool.getConnection();
-    await productService.update(connection, productId, req.body);
-    connection.release();
+    try {
+      await productService.update(connection, productId, req.body);
+    } finally {
+      connection.release();
+    }
 
     res.json({ message: 'Product updated successfully' });
   } catch (error) {
+    if (error.errorCode === 'BRAND_NOT_FOUND') {
+      return res.status(400).json({ success: false, message: error.message, errorCode: error.errorCode, timestamp: new Date().toISOString() });
+    }
     next(error);
   }
 };

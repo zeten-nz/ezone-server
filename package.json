@@ -12,8 +12,7 @@
     "pm2:logs": "pm2 logs ezone-api",
     "pm2:status": "pm2 status",
     "create-admin": "node create-admin.js",
-    "reset": "node reset-database.js",
-    "easygas:test-connection": "node test-easygas-connection.js"
+    "reset": "node reset-database.js"
   },
   "type": "commonjs",
   "engines": {

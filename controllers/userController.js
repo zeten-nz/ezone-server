@@ -43,7 +43,7 @@ const createUser = async (req, res, next) => {
 
     await connection.execute(
       'INSERT INTO users (full_name, username, password, phone, branch_id, role, is_active) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      [full_name, username, hashedPassword, phone, branch_id || null, 'EMPLOYEE', true]
+      [full_name, username, hashedPassword, phone ?? null, branch_id || null, 'EMPLOYEE', true]
     );
 
     connection.release();
@@ -66,12 +66,16 @@ const updateUser = async (req, res, next) => {
 
     const connection = await pool.getConnection();
 
-    await connection.execute(
+    const [result] = await connection.execute(
       'UPDATE users SET full_name = ?, phone = ?, branch_id = ? WHERE id = ?',
-      [full_name, phone, branch_id || null, userId]
+      [full_name, phone ?? null, branch_id || null, userId]
     );
 
     connection.release();
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ success: false, message: 'User not found', errorCode: 'NOT_FOUND', timestamp: new Date().toISOString() });
+    }
 
     res.json({ message: 'User updated successfully' });
   } catch (error) {
@@ -87,12 +91,16 @@ const setUserActive = (isActive) => async (req, res, next) => {
     const { userId } = req.params;
     const connection = await pool.getConnection();
 
-    await connection.execute(
+    const [result] = await connection.execute(
       'UPDATE users SET is_active = ? WHERE id = ? AND role = ?',
       [isActive, userId, 'EMPLOYEE']
     );
 
     connection.release();
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ success: false, message: 'User not found, or is not an employee account', errorCode: 'NOT_FOUND', timestamp: new Date().toISOString() });
+    }
 
     res.json({ message: isActive ? 'User enabled successfully' : 'User disabled successfully' });
   } catch (error) {
@@ -118,12 +126,16 @@ const setSuperAdmin = async (req, res, next) => {
     const { isSuperAdmin } = req.body;
     const connection = await pool.getConnection();
 
-    await connection.execute(
+    const [result] = await connection.execute(
       'UPDATE users SET is_super_admin = ? WHERE id = ? AND role = ?',
       [!!isSuperAdmin, userId, 'ADMIN']
     );
 
     connection.release();
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ success: false, message: 'User not found, or is not an admin account', errorCode: 'NOT_FOUND', timestamp: new Date().toISOString() });
+    }
 
     res.json({ message: isSuperAdmin ? 'Super Admin granted' : 'Super Admin revoked' });
   } catch (error) {
@@ -143,12 +155,16 @@ const resetPassword = async (req, res, next) => {
     const hashedPassword = await bcrypt.hash(newPassword, 10);
     const connection = await pool.getConnection();
 
-    await connection.execute(
+    const [result] = await connection.execute(
       'UPDATE users SET password = ? WHERE id = ?',
       [hashedPassword, userId]
     );
 
     connection.release();
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ success: false, message: 'User not found', errorCode: 'NOT_FOUND', timestamp: new Date().toISOString() });
+    }
 
     res.json({ message: 'Password reset successfully' });
   } catch (error) {

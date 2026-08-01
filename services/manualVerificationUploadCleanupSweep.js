@@ -3,8 +3,8 @@ const path = require('path');
 const manualVerificationUploadRepository = require('../repositories/manualVerificationUploadRepository');
 const { MANUAL_VERIFICATION_UPLOAD_DIR } = require('../config/uploads');
 
-// Same interval class as easyGasSyncSweep, but far lower urgency — an
-// abandoned upload sitting an extra hour costs nothing but disk space.
+// A lower-urgency interval than most sweeps — an abandoned upload sitting
+// an extra hour costs nothing but disk space.
 const SWEEP_INTERVAL_MS = parseInt(process.env.MANUAL_VERIFICATION_CLEANUP_INTERVAL_MS, 10) || 60 * 60_000; // 1 hour
 // Matches the same 24-hour mental model already used elsewhere in this
 // feature (the installer edit window) — not a hard requirement, just a
@@ -18,7 +18,7 @@ const ORPHAN_GRACE_HOURS = 24;
  * for the exact "orphaned" definition — a live NOT EXISTS check against
  * warranty_equipment, not a separately-maintained flag). One row, fully
  * isolated per file: a single bad unlink must never stop the rest of the
- * batch or the sweep interval itself, same discipline easyGasSyncSweep uses.
+ * batch or the sweep interval itself.
  */
 const runCleanupCycle = async (pool) => {
   const orphaned = await manualVerificationUploadRepository.findOrphaned(pool, ORPHAN_GRACE_HOURS);
@@ -48,9 +48,8 @@ const runCleanupCycle = async (pool) => {
 };
 
 /**
- * Starts the interval-based orphan-upload cleanup. Same "outer .catch must
- * never let a rejection escape uncaught" discipline as
- * easyGasSyncSweep.startEasyGasSyncSweep — this app crashes its whole PM2
+ * Starts the interval-based orphan-upload cleanup. The outer `.catch` must
+ * never let a rejection escape uncaught — this app crashes its whole PM2
  * worker on an unhandled rejection.
  */
 const startManualVerificationUploadCleanupSweep = (pool) => {

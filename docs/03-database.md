@@ -14,9 +14,9 @@ Status tags: **Live** (actively written/read), **Legacy** (superseded, kept for 
 `is_super_admin` is an **additive flag on top of ADMIN, not a third role**. `is_active` gates login and is re-checked live on every request (see [04-backend.md](04-backend.md)).
 
 ### `branches` — Live
-`id, code (UNIQUE, immutable after creation), easygas_stag_code VARCHAR(20) NULL, name, phone, region, district, city, is_active, created_at, updated_at`.
+`id, code (UNIQUE, immutable after creation), name, phone, region, district, city, is_active, created_at, updated_at`. Doubles as the inventory system's "warehouse" concept.
 
-`easygas_stag_code` is new this session — EasyGas's real STAG-format branch code (e.g. `"01/1"`), genuinely distinct from `code` (this app's own internal identifier, e.g. `"BR001"`). No column exists to auto-populate it; it's a manual, ops-entered value (see [07-easygas-integration.md](07-easygas-integration.md)). Doubles as the inventory system's "warehouse" concept.
+A deprecated STAG-branch-code column (`VARCHAR(20) NULL`) also still physically exists on this table — **Dead**. It was added for the now fully-removed third-party warranty-sync integration; no code reads or writes it anymore. Left in place pending a future cleanup migration rather than dropped immediately.
 
 ### `registration_requests` — Live
 `id, first_name, last_name, region, district, branch_code, branch_id → branches.id (nullable), phone, username, password_hash, photo_filename NOT NULL, status ENUM('PENDING','APPROVED','REJECTED') DEFAULT 'PENDING', notes, reviewed_at, reviewed_by → users.id, created_at, updated_at`. Never grants login on its own — only admin approval creates the real `users` row.
@@ -32,9 +32,10 @@ One row per vehicle gas-conversion warranty — the central business record.
 - **Vehicle**: `vehicle_name` (current free-text field) + optional `car_id → cars.id` catalog match; `vehicle_brand`/`vehicle_model`/`vehicle_engine_volume`/`vehicle_engine_power` — **Legacy**, nullable, historical-display only, never written by current code; `vehicle_production_year`, `vehicle_vin`, `vehicle_mileage` required; `vehicle_plate_number` nullable.
 - **`fuel_type` ENUM('LPG','CNG') NULL** — single top-level fuel type for the whole installation.
 - **Legacy 4-slot flat equipment columns** — `reducer_fuel_type/manufacturer/serial_number`, `cylinder_fuel_type/manufacturer/serial_number`, `stag_controller_manufacturer/serial_number`, `injector_rail_manufacturer/serial_number` — all nullable, all **Legacy**, superseded by `warranty_equipment`.
-- **`warranty_book_number`** — nullable; installers no longer type one, EasyGas generates the real value and it's written back by the sync sweep.
-- **EasyGas sync columns** (written only by the background sweep, never by create/update): `submission_uuid VARCHAR(36) UNIQUE`, `easygas_sync_status ENUM('PENDING','SYNCING','SYNCED','FAILED')`, `easygas_sync_terminal BOOLEAN`, `easygas_sync_attempts INT`, `easygas_sync_claimed_at`, `easygas_synced_at`, `easygas_warranty_number`, `easygas_last_error`.
-- Indexes: `idx_warranty_forms_sync_status(easygas_sync_status)`, `idx_warranty_forms_installation_date(installation_date)`.
+- **`warranty_book_number`** — populated synchronously at creation time via `getNextWarrantyNumber` (`warrantyRepository.js`), which generates a locally-assigned sequential value (e.g. `W-2026-000001`) from the `warranty_number_sequences` table (`year INT PRIMARY KEY, last_number INT`), inside the same transaction as the insert. No longer nullable in practice — installers never type one, and nothing external assigns it.
+- `submission_uuid VARCHAR(36) UNIQUE` — **Live**, used for idempotent create (a retried `POST` with the same value returns the existing form instead of hitting a raw UNIQUE-constraint error).
+- **Deprecated legacy sync-tracking columns — Dead.** Phase 1 of a two-phase removal: the third-party warranty-sync integration these columns supported has been fully and permanently removed from the codebase, but the columns themselves (seven in total — a sync-status enum, a terminal-failure flag, a retry-attempt counter, a claimed-at timestamp, a synced-at timestamp, an externally-assigned warranty number, and a last-error text field) still physically exist, are marked DEPRECATED in `config/database.js`, and are no longer read or written by any code path. A future Phase 2 migration will drop them.
+- Indexes: `idx_warranty_forms_installation_date(installation_date)` — **Live**. `idx_warranty_forms_sync_status` (indexing the deprecated sync-status column above) still physically exists but is **Dead** — nothing queries by it anymore.
 
 ### `warranty_form_products` — Dead
 `id, warranty_form_id → warranty_forms.id (CASCADE), product_id → products.id (RESTRICT, UNIQUE), created_at`. Superseded by `warranty_equipment`'s fixed 4-slot model; a one-time migration already promoted any pre-existing rows. **No new warranty ever writes here again.** Kept only so historical rows keep displaying.
@@ -50,28 +51,27 @@ One row per warranty per fixed equipment slot — the current model.
 - `inventory_item_id → inventory_items.id` (SET NULL) — the exact physical unit claimed; always null for a typed cylinder, since there's no barcode/inventory concept for one.
 - **Dormant**: `equipment_validation_status ENUM('PENDING','VALID','INVALID')`, `validated_at`, `reward_points`, `reward_transaction_id`, `validation_response JSON` — schema-ready for a still-unbuilt external STAG equipment-validation API, never populated by any code path.
 
-## Catalog (EasyGas-Synced)
+## Catalog (Local Master Data)
+
+Brands, cars, and products are local ERP master data managed entirely through admin CRUD — none of it is synchronized with any external system.
 
 ### `products` — Live
 Installable equipment models (not physical units — see `inventory_items`).
 
 - `category` ENUM, 10 values (`REDUCER, CYLINDER, ECU, INJECTOR_RAIL, FILLING_VALVE, MULTIVALVE, PRESSURE_SENSOR, FILTER, OTHER, CONTROLLER`).
-- `brand_id → brands.id` (nullable) alongside the original free-text `brand` column — **deliberately dual-written**, since search/display still reads the text column.
-- **`external_id` — Live, not dormant.** The previous documentation pass called this dormant "until a future external STAG catalog integration" — that integration is exactly what's live now; every EasyGas-sourced product carries a real `external_id` confirmed to match EasyGas's own catalog ids.
-- `fuel_type ENUM('LPG','CNG') NULL` — `NULL` means fuel-agnostic, derived from EasyGas's `station_type`.
+- `brand_id → brands.id` (nullable, real FK) alongside the original free-text `brand` column — **deliberately dual-written**: kept in sync on every product create/update, since product search/`getDistinctBrands` already key off the text column.
+- `fuel_type ENUM('LPG','CNG') NULL` — `NULL` means fuel-agnostic; set directly by an admin when creating/editing a product.
 - `serial_number`, `qr_code` — **Dead**, from when this table was one-row-per-physical-unit; unique indexes dropped.
 - `score INT DEFAULT 0` — **Dead**, superseded by `product_point_configs`, never read by any current code path.
 - `status ENUM('IN_STOCK','INSTALLED','RETIRED')` — **Dead**, superseded by `is_active`.
-- `is_active`, `synced_at`.
+- `is_active` — **Live**.
+- `external_id`, `synced_at` — **Dead**, leftovers from the removed third-party catalog-sync integration (Phase 1 of a two-phase removal, per the note under `warranty_forms` above); no code reads or writes either anymore.
 
 ### `brands` — Live
-EasyGas-synced. `external_id UNIQUE`, `name`, `full_name`, `country`, `logo_url`, `synced_at`. No cross-worker deletion-detection added this session (only `products`/`cars` got it) — out of scope for now, a small stable list.
+Local ERP master data — full admin CRUD (list, active-only list, create, update, activate/deactivate, delete) via `repositories/brandRepository.js` + `controllers/brandController.js` + `routes/brandRoutes.js`, mounted at `/api/brands`. `id, name, full_name, country, logo_url, is_active, created_at, updated_at`. A deprecated `external_id UNIQUE` and `synced_at` still physically exist — **Dead**, leftovers from the removed third-party catalog-sync integration, no longer read or written by any code path.
 
 ### `cars` — Live
-EasyGas-synced vehicle catalog, flat `brand`/`model` strings (not FK'd to `brands`). `external_id UNIQUE`, `is_active` (**new this session**, deletion-detection support), `external_updated_at` (**Dead** — never populated; the real API field is `updated_at`, received but not currently stored), `synced_at`.
-
-### `sync_state` — Live, visibility-only
-`sync_key VARCHAR(50) PRIMARY KEY, last_synced_at`. Recorded on every sync for "when did this last succeed" visibility. **Not used to filter any request** — every cycle does a full walk, deliberately (see [07-easygas-integration.md](07-easygas-integration.md) for why incremental sync can't detect catalog deletions).
+Local ERP master data, flat `brand`/`model` strings (not FK'd to `brands`) — full admin CRUD (list, active-only list, create, update, activate/deactivate, delete) via `repositories/carRepository.js` + `controllers/carController.js` + `routes/carRoutes.js`, mounted at `/api/cars`, plus the pre-existing `GET /api/cars/search` used by the warranty form's Vehicle Name autocomplete. `id, brand, model, is_active, created_at, updated_at`. A deprecated `external_id UNIQUE`, `external_updated_at`, and `synced_at` still physically exist — **Dead**, leftovers from the removed third-party catalog-sync integration, no longer read or written by any code path.
 
 ## Inventory
 
@@ -127,6 +127,5 @@ Append-only reward ledger — never UPDATEd/DELETEd. No stored balance; current 
 2. **`seedPlaceholderBranches`** — fresh-install-only seed, no-ops once `branches` has any row.
 3. **`migrateWarrantyFormProducts`** — one-time promotion of legacy `warranty_form_products` rows into `warranty_equipment`.
 4. **`backfillWarrantyFuelType`** — fills `warranty_forms.fuel_type` from historical per-row data.
-5. **`backfillEasyGasSkipLegacyWarranties`** — marks pre-EasyGas-integration warranties terminal-`FAILED` so they don't starve the retry sweep.
 
 All migrations in this file are confirmed additive-only — zero destructive drops found anywhere; every change either adds a column/table/index or relaxes a constraint (`ensureColumn`, `ensureNullableColumn`, `ensureColumnRenamed`, `ensureForeignKeyRestrict`, `ensureIndexAdded`, `ensureEnumValue`), checked against `information_schema` first so re-running on every boot is always safe.

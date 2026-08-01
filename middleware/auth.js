@@ -3,10 +3,9 @@ const { pool } = require('../config/database');
 
 // JWT stays fully stateless — no session store, no revocation list. Instead,
 // every authenticated request re-checks the token's subject against the
-// database (one indexed primary-key lookup via pool.execute(), the same
-// acquire/execute/release-in-one-call idiom already used by the EasyGas sync
-// services) so that a deactivated account, or a role/is_super_admin change,
-// takes effect on the very next request — not only once the token's own
+// database (one indexed primary-key lookup via pool.execute()) so that a
+// deactivated account, or a role/is_super_admin change, takes effect on the
+// very next request — not only once the token's own
 // JWT_EXPIRE (default 7d) naturally elapses. role/is_super_admin from the
 // token payload are deliberately discarded in favor of the fresh DB values;
 // only identity fields (id/username/full_name) come from the token itself.
