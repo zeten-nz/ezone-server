@@ -234,15 +234,32 @@ const searchForms = async (connection, { search, filterType }) => {
  * scope: a customer's own warranty list is never large enough to need it).
  * Same SELECT/JOIN shape as searchForms above, filtered on owner_phone
  * instead of a free-text search term.
+ *
+ * `normalizedPhone` must already be the 9-digit national significant number
+ * (see utils/phoneFormat.js's normalizePhone) — never the raw client input.
+ * Existing owner_phone rows are NOT stored under one consistent shape
+ * (confirmed directly against production: some are a bare 9-digit number
+ * with no country code, unlike the '+998XXXXXXXXX' shape newer rows use) —
+ * rather than assume one, this reduces owner_phone to the same 9-digit key
+ * at query time via REGEXP_REPLACE (strip everything but digits) + RIGHT
+ * (take the last 9), so both sides of the comparison are on equal footing
+ * regardless of which format a given row happens to store. Stored data is
+ * never rewritten — this normalization exists only inside the WHERE clause.
+ *
+ * Trade-off, accepted deliberately: REGEXP_REPLACE/RIGHT on owner_phone
+ * makes this comparison non-sargable (no index on owner_phone can be used,
+ * so this is a full table scan) — acceptable at this table's current size;
+ * revisit with a generated/indexed column if warranty_forms grows enough
+ * for it to matter.
  */
-const findByOwnerPhone = async (connection, ownerPhone) => {
+const findByOwnerPhone = async (connection, normalizedPhone) => {
   const [rows] = await connection.execute(
     `SELECT wf.*, u.full_name AS employee_name, u.username AS employee_username, ${FUEL_TYPE_SELECT}
      FROM warranty_forms wf JOIN users u ON wf.employee_id = u.id
      ${FUEL_TYPE_JOIN}
-     WHERE wf.owner_phone = ?
+     WHERE RIGHT(REGEXP_REPLACE(wf.owner_phone, '[^0-9]', ''), 9) = ?
      ORDER BY wf.created_at DESC`,
-    [ownerPhone]
+    [normalizedPhone]
   );
   return rows;
 };
