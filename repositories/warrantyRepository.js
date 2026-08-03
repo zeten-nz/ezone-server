@@ -228,6 +228,25 @@ const searchForms = async (connection, { search, filterType }) => {
   return rows;
 };
 
+/**
+ * Public customer lookup — every warranty registered to a given owner phone
+ * number, newest first. No pagination (matches the original endpoint's
+ * scope: a customer's own warranty list is never large enough to need it).
+ * Same SELECT/JOIN shape as searchForms above, filtered on owner_phone
+ * instead of a free-text search term.
+ */
+const findByOwnerPhone = async (connection, ownerPhone) => {
+  const [rows] = await connection.execute(
+    `SELECT wf.*, u.full_name AS employee_name, u.username AS employee_username, ${FUEL_TYPE_SELECT}
+     FROM warranty_forms wf JOIN users u ON wf.employee_id = u.id
+     ${FUEL_TYPE_JOIN}
+     WHERE wf.owner_phone = ?
+     ORDER BY wf.created_at DESC`,
+    [ownerPhone]
+  );
+  return rows;
+};
+
 const deleteById = async (connection, formId) => {
   // warranty_equipment rows for this form are cleaned up automatically via
   // ON DELETE CASCADE — no manual unlink step needed (unlike the old
@@ -289,6 +308,7 @@ module.exports = {
   findMinePaginated,
   findDetailById,
   searchForms,
+  findByOwnerPhone,
   deleteById,
   findChunkForExport,
 };

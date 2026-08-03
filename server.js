@@ -86,6 +86,7 @@ const carRoutes                       = require('./routes/carRoutes');
 const inventoryRoutes                 = require('./routes/inventoryRoutes');
 const pointsRoutes                    = require('./routes/pointsRoutes');
 const exportCsvRoutes                 = require('./routes/exportCsvRoutes');
+const publicCustomerRoutes            = require('./routes/publicCustomerRoutes');
 const { exportWarrantyForms, exportByBranch, exportEmployeeData } =
   require('./controllers/excelController');
 const { verifyToken, authorizeRole }  = require('./middleware/auth');
@@ -238,6 +239,9 @@ app.use('/api/cars', carRoutes);
 app.use('/api/inventory', inventoryRoutes);
 app.use('/api/points', pointsRoutes);
 app.use('/api/export-csv', exportCsvRoutes);
+// Restored — see docs/09-security.md. Deliberately public (no verifyToken):
+// an explicitly-accepted trade-off, not an oversight.
+app.use('/api/public/customer', publicCustomerRoutes);
 app.get('/api/export/warranty', verifyToken, authorizeRole('ADMIN'), exportWarrantyForms);
 app.get('/api/export/branch',   verifyToken, authorizeRole('ADMIN'), exportByBranch);
 app.get('/api/export/employee', verifyToken, exportEmployeeData);
