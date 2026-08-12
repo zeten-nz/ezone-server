@@ -46,6 +46,21 @@ const toWarrantyResponse = (form) => {
     employee_username: form.employee_username,
     warranty_book_number: form.warranty_book_number,
     submission_uuid: form.submission_uuid,
+    // Warranty status workflow — the form's own lifecycle. Deliberately
+    // separate from equipment[].verification_status (Manual Verification,
+    // a per-equipment-row barcode concern) — never conflate the two.
+    status: form.status,
+    reviewed_by: form.reviewed_by,
+    reviewed_at: form.reviewed_at,
+    review_notes: form.review_notes,
+    // EasyGas sync result — populated only once `status` above is
+    // SUCCESSFUL and a sync attempt has actually run (see
+    // easyGasWarrantySyncService.js). easygas_claim_url is what the
+    // frontend's "View EasyGas Warranty" button opens.
+    easygas_claim_url: form.easygas_claim_url,
+    easygas_sync_result: form.easygas_sync_result,
+    easygas_sync_completed_at: form.easygas_sync_completed_at,
+    easygas_sync_error: form.easygas_sync_error,
     installation_date: form.installation_date,
     fuel_type: form.fuel_type,
     vehicle_name: resolveVehicleName(form),

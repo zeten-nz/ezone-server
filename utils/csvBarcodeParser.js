@@ -59,10 +59,14 @@ const parseWithBestDelimiter = (buffer) => {
 // Checked first — this system tracks physical units by barcode
 // (inventory_items.barcode), so if a file has both a "Barcode" and a
 // "Serial Number" column, the barcode column is the correct one to import.
-// Deliberately no bare 'sn'/'id'/'no'/'number' — too short/generic, real
-// risk of matching an unrelated header, or worse, matching real barcode
-// *data* in a headerless file (e.g. a barcode literally starting "SN-").
-const BARCODE_HEADER_KEYWORDS = ['barcode', 'bar code', 'штрихкод', 'shtrix'];
+// 'vin' is included here, not as a separate tier: a supplier-issued VIN
+// code (e.g. from the vin-codes/ TXT exports) IS the barcode value for this
+// system — it's stored in inventory_items.barcode like any other, never a
+// distinct concept. Deliberately no bare 'sn'/'id'/'no'/'number' — too
+// short/generic, real risk of matching an unrelated header, or worse,
+// matching real barcode *data* in a headerless file (e.g. a barcode
+// literally starting "SN-").
+const BARCODE_HEADER_KEYWORDS = ['barcode', 'bar code', 'vin', 'штрихкод', 'shtrix'];
 
 // Checked only if no cell matched a barcode-tier keyword.
 const SERIAL_HEADER_KEYWORDS = ['serial', 'серийный', 'seriya'];

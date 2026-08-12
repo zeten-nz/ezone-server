@@ -1,10 +1,17 @@
 const { buildSignedHeaders } = require('../utils/easyGasSigning');
 
-// EasyGas's catalog API — per EasyGas's own request, now shares the SAME
-// signed base URL/secret as the private warranty-submission API (see
-// easyGasWarrantyClient.js), replacing the old separate, unsigned public
-// catalog API. EASYGAS_CATALOG_API_BASE_URL is retired; do not reintroduce it.
-const BASE_URL = process.env.EASYGAS_WARRANTY_API_BASE_URL;
+// EasyGas's catalog API — per EasyGas's own request, shares the SAME signed
+// secret as the private warranty-submission API (see easyGasWarrantyClient.js),
+// but lives under a DIFFERENT path on the same host: /public/api/... rather
+// than /api/integrations/warranty. EASYGAS_WARRANTY_API_BASE_URL is the full
+// warranty endpoint URL (e.g. https://admin.stag.uz/api/integrations/warranty)
+// — not usable as a string-concatenation prefix for the catalog paths, which
+// are confirmed real endpoints (not invented): /public/api/products,
+// /public/api/product-brands, /public/api/cars. ORIGIN below is just the
+// protocol+host portion of that same configured URL — no separate catalog
+// base URL env var exists or is introduced here (EASYGAS_CATALOG_API_BASE_URL
+// stays retired, per the prior note this replaces).
+const ORIGIN = process.env.EASYGAS_WARRANTY_API_BASE_URL ? new URL(process.env.EASYGAS_WARRANTY_API_BASE_URL).origin : undefined;
 const SHARED_SECRET = process.env.EASYGAS_SHARED_SECRET;
 const REQUEST_TIMEOUT_MS = 3000;
 
@@ -25,12 +32,15 @@ const toQueryString = (params) => {
  * trip server.js's unhandledRejection handler and kill the entire PM2 worker.
  */
 const request = async (method, path) => {
+  if (!ORIGIN) {
+    return { ok: false, status: 0, data: null, networkError: true, errorMessage: 'EASYGAS_WARRANTY_API_BASE_URL not configured' };
+  }
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   try {
     // GET-only client — every request signs an empty body.
     const signedHeaders = buildSignedHeaders(SHARED_SECRET, '');
-    const response = await fetch(`${BASE_URL}${path}`, {
+    const response = await fetch(`${ORIGIN}${path}`, {
       method,
       headers: { 'Content-Type': 'application/json', ...signedHeaders },
       signal: controller.signal,
@@ -44,16 +54,16 @@ const request = async (method, path) => {
   }
 };
 
-const getProducts = (params) => request('GET', `/products${toQueryString(params)}`);
-// Path is /brands under the new signed API — distinct from the old public
-// API's /product-brands, since this is a different endpoint family.
-const getProductBrands = (params) => request('GET', `/brands${toQueryString(params)}`);
-const getCars = (params) => request('GET', `/cars${toQueryString(params)}`);
-// New endpoint EasyGas mentioned for real STAG branch codes. Deliberately
-// NOT wired into easyGasCatalogSyncService.js/easyGasCatalogSyncSweep.js in
-// this batch — branches.easygas_stag_code is a manually ops-entered value
-// (see config/database.js), not something auto-synced yet. Exposed here so
-// a future sync can use it.
+// Confirmed real paths — do not change without a real, confirmed replacement.
+const getProducts = (params) => request('GET', `/public/api/products${toQueryString(params)}`);
+const getProductBrands = (params) => request('GET', `/public/api/product-brands${toQueryString(params)}`);
+const getCars = (params) => request('GET', `/public/api/cars${toQueryString(params)}`);
+// Branches endpoint — NOT part of this update (out of scope: the task that
+// produced this change only confirmed /public/api/products,
+// /public/api/product-brands, and /public/api/cars). Left unchanged from
+// its prior path (still unconfirmed against the new API) and still not
+// wired into easyGasCatalogSyncService.js/easyGasCatalogSyncSweep.js —
+// branches.easygas_stag_code remains a manually ops-entered value.
 const getBranches = (params) => request('GET', `/branches${toQueryString(params)}`);
 
 module.exports = { getProducts, getProductBrands, getCars, getBranches };

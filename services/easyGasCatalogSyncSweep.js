@@ -1,45 +1,42 @@
 /**
- * Periodic catalog sync — the only path that ever pulls brands/products/cars
- * from EasyGas. Separate, much slower cadence than the warranty-push sweep
+ * Periodic catalog sync — one of two paths that pull brands/products/cars
+ * from EasyGas, the other being the admin "Sync EasyGas Catalog" entry point
+ * (routes/catalogSyncRoutes.js). Both call the exact same
+ * easyGasCatalogSyncService.runFullSync, so Last Sync Time/Status/Message
+ * reflects whichever ran most recently, whether triggered by a click or by
+ * this timer — and the two can never run concurrently, since runFullSync
+ * itself claims a real DB-level lock now (see acquireSyncLock in that file).
+ * If this cycle fires while the button-triggered sync (possibly on a
+ * different PM2 worker) is still running, runFullSync just returns
+ * `conflict: true` immediately and this cycle quietly no-ops — see below.
+ * Separate, much slower cadence than the warranty-push sweep
  * (easyGasSyncSweep.js): catalogs change far less often than warranties need
- * pushing, and there's no per-row race to guard here (this sweep only ever
- * reads from EasyGas and upserts locally — nothing to atomically "claim").
- * Same crash-safety contract as the warranty sweep: every cycle is wrapped
- * so a failure never escapes as an unhandled rejection into server.js's
- * process.exit(1) handler.
+ * pushing. Same crash-safety contract as the warranty sweep: every cycle is
+ * wrapped so a failure never escapes as an unhandled rejection into
+ * server.js's process.exit(1) handler.
  */
 const easyGasCatalogSyncService = require('./easyGasCatalogSyncService');
 
 const CATALOG_SYNC_INTERVAL_MS = parseInt(process.env.EASYGAS_CATALOG_SYNC_INTERVAL_MS, 10) || 300_000;
 
-/**
- * Brands always sync first — products.brand_id's FK needs the referenced
- * brand to already exist locally before a product upsert can resolve it
- * (see easyGasCatalogSyncService.upsertProduct). If brands fail (e.g. a
- * network hiccup), skip products/cars entirely this cycle rather than
- * upserting products against a stale/incomplete brand list.
- */
 const runCatalogSyncCycle = async (pool) => {
-  const brandsResult = await easyGasCatalogSyncService.syncBrands(pool);
-  if (!brandsResult.ok) {
-    console.warn('[EasyGas Catalog Sync] Brands sync failed, skipping this cycle:', brandsResult.reason);
+  const result = await easyGasCatalogSyncService.runFullSync(pool);
+  if (result.conflict) {
+    // Not a failure — the admin "Sync EasyGas Catalog" button (or a
+    // still-running previous cycle) already holds the lock. Just skip this
+    // tick; the next interval will try again.
+    console.log('[EasyGas Catalog Sync] Skipping this cycle — a sync is already running');
     return;
   }
-  console.log(`[EasyGas Catalog Sync] Brands: ${brandsResult.imported} imported, ${brandsResult.skipped} skipped (of ${brandsResult.total})`);
-
-  const productsResult = await easyGasCatalogSyncService.syncProducts(pool);
-  if (productsResult.ok) {
-    console.log(`[EasyGas Catalog Sync] Products: ${productsResult.imported} imported, ${productsResult.skippedCategory} skipped (unmapped category), ${productsResult.skippedBrand} skipped (unresolved brand)`);
-  } else {
-    console.warn('[EasyGas Catalog Sync] Products sync failed this cycle');
+  if (!result.ok) {
+    console.warn(`[EasyGas Catalog Sync] Cycle failed: ${result.message}`);
+    return;
   }
-
-  const carsResult = await easyGasCatalogSyncService.syncCars(pool);
-  if (carsResult.ok) {
-    console.log(`[EasyGas Catalog Sync] Cars: ${carsResult.imported} imported, ${carsResult.skipped} skipped`);
-  } else {
-    console.warn('[EasyGas Catalog Sync] Cars sync failed this cycle');
-  }
+  const { brandsResult, productsResult, carsResult } = result;
+  console.log(`[EasyGas Catalog Sync] Brands: ${brandsResult.inserted} inserted, ${brandsResult.updated} updated, ${brandsResult.skipped} skipped, ${brandsResult.failed} failed (of ${brandsResult.total})`);
+  console.log(`[EasyGas Catalog Sync] Products: ${productsResult.inserted} inserted, ${productsResult.updated} updated, ${productsResult.skipped} skipped, ${productsResult.failed} failed`);
+  console.log(`[EasyGas Catalog Sync] Cars: ${carsResult.inserted} inserted, ${carsResult.updated} updated, ${carsResult.skipped} skipped, ${carsResult.failed} failed`);
+  console.log(`[EasyGas Catalog Sync] Cycle completed in ${result.durationMs}ms`);
 };
 
 // PM2 cluster mode sets NODE_APP_INSTANCE to '0', '1', '2', ... per worker,

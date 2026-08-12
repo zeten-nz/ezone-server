@@ -131,6 +131,40 @@ const lockForm = async (connection, formId) => {
   return rows[0] || null;
 };
 
+/**
+ * Warranty status workflow — admin review action. Atomic guard: WHERE
+ * status = 'PENDING', same idiom as equipmentRepository.reviewVerification/
+ * inventoryRepository.claimForInstallation. affectedRows === 1 is the only
+ * signal that matters: it's what guarantees a warranty can never be
+ * reviewed twice, and — critically — it's what guarantees the EasyGas sync
+ * that follows a SUCCESSFUL decision can only ever fire once (the caller,
+ * warrantyService.reviewWarrantyForm, only syncs when this returns true).
+ */
+const reviewForm = async (connection, { formId, decision, reviewedBy, notes }) => {
+  const [result] = await connection.execute(
+    `UPDATE warranty_forms SET status = ?, reviewed_by = ?, reviewed_at = NOW(), review_notes = ? WHERE id = ? AND status = 'PENDING'`,
+    [decision, reviewedBy, notes || null, formId]
+  );
+  return result.affectedRows === 1;
+};
+
+/**
+ * Records the outcome of one EasyGas sync attempt. Called AFTER
+ * reviewForm's transaction has already committed, outside any transaction
+ * of its own — a network call must never hold a DB connection/lock open
+ * (see easyGasWarrantySyncService.syncWarrantyForm). A FAILED result here
+ * does not revert `status` — the admin's SUCCESSFUL decision stands
+ * regardless of whether EasyGas was reachable; the failure is only ever
+ * recorded, never retried automatically (no background sweep — see the
+ * design notes this feature was built from).
+ */
+const updateEasyGasSyncResult = async (connection, formId, { result, claimUrl, error }) => {
+  await connection.execute(
+    `UPDATE warranty_forms SET easygas_sync_result = ?, easygas_claim_url = ?, easygas_sync_error = ?, easygas_sync_completed_at = NOW() WHERE id = ?`,
+    [result, claimUrl || null, error || null, formId]
+  );
+};
+
 // `employeeId` scopes the admin list to one installer's warranties (e.g. an
 // "open installer" drill-down from statistics) — optional, combined with
 // `search`/pagination exactly like every other admin list filter, not a
@@ -321,6 +355,8 @@ module.exports = {
   findOwnershipInfo,
   findBySubmissionUuid,
   lockForm,
+  reviewForm,
+  updateEasyGasSyncResult,
   findAllPaginated,
   findMinePaginated,
   findDetailById,

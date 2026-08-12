@@ -1,9 +1,11 @@
+const { pool } = require('../config/database');
 const AppError = require('../utils/AppError');
 const warrantyRepository = require('../repositories/warrantyRepository');
 const equipmentRepository = require('../repositories/equipmentRepository');
 const productRepository = require('../repositories/productRepository');
 const inventoryService = require('./inventoryService');
 const pointsService = require('./pointsService');
+const easyGasWarrantySyncService = require('./easyGasWarrantySyncService');
 
 const { REQUIRED_EQUIPMENT_TYPES } = equipmentRepository;
 const EDIT_WINDOW_HOURS = 24;
@@ -564,6 +566,59 @@ const reviewManualVerification = async (connection, equipmentId, adminUserId, { 
   }
 };
 
+/**
+ * Warranty status workflow — the admin review action, one level up from
+ * reviewManualVerification above (that one reviews a single equipment
+ * row's barcode identity; this one reviews the warranty form itself, a
+ * completely separate concept — see the design notes this feature was
+ * built from for why the two are deliberately kept apart).
+ *
+ * `decision` is 'SUCCESSFUL' or 'REJECTED', validated here rather than
+ * trusted from the controller — mirrors reviewManualVerification exactly.
+ *
+ * EasyGas sync is triggered AFTER this function's own transaction commits,
+ * never inside it: a network call must never hold a DB connection/lock
+ * open. It only fires when reviewForm's atomic guard actually flips
+ * PENDING -> SUCCESSFUL (never on REJECTED, never on a request that loses
+ * a concurrency race — see warrantyRepository.reviewForm), which is what
+ * guarantees "never before, never twice" end to end. A sync failure is
+ * recorded (see easyGasWarrantySyncService) but never re-throws — the
+ * admin's approval already committed successfully and must not appear to
+ * fail just because EasyGas was unreachable.
+ */
+const reviewWarrantyForm = async (connection, formId, adminUserId, { decision, notes }) => {
+  if (!['SUCCESSFUL', 'REJECTED'].includes(decision)) {
+    throw new AppError('decision must be SUCCESSFUL or REJECTED', 400, 'VALIDATION_ERROR');
+  }
+
+  await connection.beginTransaction();
+  try {
+    const lockedForm = await warrantyRepository.lockForm(connection, formId);
+    if (!lockedForm) {
+      throw new AppError('Warranty form not found', 404, 'NOT_FOUND');
+    }
+
+    const reviewed = await warrantyRepository.reviewForm(connection, {
+      formId,
+      decision,
+      reviewedBy: adminUserId,
+      notes,
+    });
+    if (!reviewed) {
+      throw new AppError('This warranty form has already been reviewed', 409, 'INVALID_STATE');
+    }
+
+    await connection.commit();
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  }
+
+  if (decision === 'SUCCESSFUL') {
+    await easyGasWarrantySyncService.syncWarrantyForm(pool, formId);
+  }
+};
+
 const deleteWarrantyForm = async (connection, formId, actingUserId) => {
   await connection.beginTransaction();
   try {
@@ -612,6 +667,7 @@ module.exports = {
   createWarrantyForm,
   updateWarrantyForm,
   reviewManualVerification,
+  reviewWarrantyForm,
   deleteWarrantyForm,
   EDIT_WINDOW_HOURS,
 };

@@ -121,11 +121,17 @@ const reviewVerification = async (connection, { equipmentId, decision, reviewedB
 // product_brand above, mirroring registration_requests' own reviewer_name
 // join (registrationRequestController.js) so the admin detail view can show
 // who reviewed a Manual Verification row without a separate lookup.
+// product_external_id: EasyGas's own catalog id for this product (see
+// products.external_id), needed only by easyGasWarrantySyncService's
+// components[].product_id mapping — added here rather than a separate
+// lookup so that sync doesn't need its own N+1 query. NULL for any product
+// created after the old catalog-sync integration was removed; harmless for
+// every other existing caller, which already ignores unrecognized fields.
 const findByWarrantyFormIds = async (connection, formIds) => {
   if (formIds.length === 0) return [];
   const placeholders = formIds.map(() => '?').join(',');
   const [rows] = await connection.execute(
-    `SELECT we.*, p.brand AS product_brand, p.category AS product_category,
+    `SELECT we.*, p.brand AS product_brand, p.category AS product_category, p.external_id AS product_external_id,
             ru.full_name AS reviewed_by_name
      FROM warranty_equipment we
      LEFT JOIN products p ON p.id = we.product_id

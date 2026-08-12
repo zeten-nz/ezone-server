@@ -8,11 +8,73 @@
  * context where manually acquiring/releasing a connection is pure risk for
  * no benefit).
  *
- * Every field mapping in this file was confirmed against real responses
- * pulled directly from EasyGas's signed catalog endpoints (same base/secret
- * as the warranty push — see easyGasCatalogClient.js), not guessed: real
- * /branches, /products (component_type, station_type, product_brand_id,
- * product_category_id, updated_at), /cars, and /brands responses.
+ * Field mapping (product_category_id, product_brand_id, station_type, name,
+ * id on products; id/brand_id/brand_name/name on cars; id/name/full_name/
+ * country/logo on brands) has been independently re-confirmed by directly
+ * calling the live /public/api/products, /public/api/product-brands, and
+ * /public/api/cars endpoints (they require no valid signature to return
+ * data — see easyGasCatalogClient.js). CORRECTION to an earlier version of
+ * this comment: /public/api/products does NOT pre-filter server-side to
+ * warranty-relevant equipment — a live pull returned 207 products across 15
+ * categories (hoses, oils, accessories, sensors, fittings, emulators, gas
+ * valves, tubes, multivalves, repair kits, filters, plus the 4 warranty
+ * ones), i.e. EasyGas's entire product line, same as before. The 84 that
+ * actually end up in our `products` table are filtered entirely CLIENT-SIDE
+ * by config/externalCategoryMap.js's 4-entry whitelist (mapExternalCategory
+ * returning null for the other 123 is what does the real filtering — see
+ * upsertProduct below) — this was already correct behavior, just documented
+ * with the wrong reason. The paginated response shape genuinely is under a
+ * `meta`/`links` wrapper as documented (see walkPaginatedCatalog) — that
+ * part was confirmed correct. `component_type` still does not exist on any
+ * real product, confirmed again live.
+ *
+ * ARCHITECTURE DECISION (final, per the catalog-sync-button update): EasyGas
+ * is the single source of truth for brands/products/cars, but the app never
+ * proxies to it at read time — everything the admin UI shows comes from the
+ * local tables these upserts maintain. Synchronization (this file) is the
+ * ONLY way local catalog data ever changes; admins can view/search/paginate
+ * but can no longer create/edit/delete/activate/deactivate rows by hand (see
+ * routes/productRoutes.js, brandRoutes.js, carRoutes.js — those routes were
+ * removed). `runFullSync` below is the ONE job the admin "Sync EasyGas
+ * Catalog" button triggers (routes/catalogSyncRoutes.js), and is also what
+ * the periodic sweep (easyGasCatalogSyncSweep.js) calls — both paths share
+ * identical brands→products→cars sequencing and both record the same Last
+ * Sync Time/Status/Message (sync_state, sync_key='catalog').
+ *
+ * Per that same decision, deletion-detection (auto-deactivating local rows
+ * that vanished from a full pull) has been REMOVED from syncProducts and
+ * syncCars below — EasyGas currently exposes no explicit deletion signal, so
+ * a product/car simply missing from one pull is no longer treated as
+ * evidence it was deleted (a paused category, a mid-pagination hiccup, or a
+ * temporary EasyGas-side filter change would previously have caused a false
+ * deactivation). Sync now only ever inserts new rows and updates existing
+ * ones by external_id — it never flips is_active to FALSE. If EasyGas ever
+ * adds a real deletion mechanism (e.g. a `deleted` flag or a tombstone
+ * endpoint), that should drive is_active going forward, not absence.
+ *
+ * LOCKING (added for the "never run twice simultaneously" requirement):
+ * runFullSync claims an atomic DB-level lock (acquireSyncLock, sync_state.
+ * sync_key='catalog') before doing anything else. A plain in-memory flag
+ * would NOT be enough — the manual "Sync" button is a normal HTTP request
+ * that can land on any PM2 cluster worker, while the periodic sweep only
+ * ever runs on worker 0 (see easyGasCatalogSyncSweep.js), so two different
+ * worker processes need to agree on "is a sync already running" through
+ * something both can see: the database. If the lock can't be claimed,
+ * runFullSync returns immediately with `conflict: true` and touches nothing
+ * else — the actually-running sync's own eventual result is never
+ * overwritten. A stale RUNNING row (process crashed mid-sync) self-heals
+ * after SYNC_LOCK_STALE_MINUTES so one crash can't wedge sync forever.
+ *
+ * STATUS DETAILS: on SUCCESS, `details` is a per-entity breakdown —
+ * `{ products: {inserted, updated, skipped, failed}, brands: {...}, cars: {...} }`
+ * — inserted/updated are read directly off MySQL's own affectedRows for the
+ * `INSERT ... ON DUPLICATE KEY UPDATE` (1 = fresh insert, 2 = existing row's
+ * values changed, 0 = matched but identical — folded into "updated" here,
+ * since it was still successfully processed, just a no-op write). "failed"
+ * counts a per-row exception during that one row's upsert (a genuinely
+ * malformed record) without aborting the rest of that entity's sync — a
+ * small addition to upsertProduct/upsertBrand/upsertCar's callers, kept
+ * deliberately local to each loop iteration rather than restructuring them.
  */
 const easyGasCatalogClient = require('./easyGasCatalogClient');
 const { mapExternalCategory } = require('../config/externalCategoryMap');
@@ -20,42 +82,41 @@ const { mapExternalCategory } = require('../config/externalCategoryMap');
 const PAGE_SIZE = 100; // confirmed real max — per_page > 100 gets HTTP 422 "must not be greater than 100"
 
 /**
- * Walks every page of a Laravel-paginated EasyGas catalog endpoint.
- * Confirmed live against the signed /products and /cars endpoints: standard
- * Laravel paginate() shape, every field top-level —
- * `{current_page, data: [...], last_page, per_page, total, ...}` — no
- * `meta`/`links` wrapper. Stops as soon as a page fails (network error or
- * non-2xx) instead of skipping ahead, so a mid-walk failure just means "try
- * again next sweep cycle," never a silent gap. Deliberately NOT used for
- * brands — see syncBrands.
+ * Walks every page of the signed /public/api/products (and /cars) endpoint.
+ * EasyGas's response shape (confirmed by EasyGas, current as of this
+ * update): `{ data: [...], links: { next: ... }, meta: { current_page,
+ * last_page, ... } }` — pagination fields live under `meta`, NOT top-level.
+ * This is a real, confirmed change from the shape this function previously
+ * assumed (top-level current_page/last_page, no meta wrapper) — that older
+ * shape is no longer read anywhere. Stops as soon as a page fails (network
+ * error or non-2xx) instead of skipping ahead, so a mid-walk failure just
+ * means "try again next sweep cycle," never a silent gap. Deliberately NOT
+ * used for brands — see syncBrands (brands is a single, unpaginated call).
+ * Surfaces a short machine-readable `reason` on failure ('network' or
+ * `http_<status>`) — same convention as syncBrands's existing failure
+ * return — so runFullSync can report a real, specific Last Sync Message
+ * instead of a bare "failed".
  */
 const walkPaginatedCatalog = async (fetchPage, onPage) => {
   let page = 1;
   for (;;) {
     const result = await fetchPage(page);
-    if (!result.ok) return { ok: false };
+    if (!result.ok) return { ok: false, reason: result.networkError ? 'network' : `http_${result.status}` };
     const rows = result.data?.data || [];
     await onPage(rows);
-    // Confirmed live against the signed endpoint: last_page is a top-level
-    // field on the standard Laravel paginate() response (current_page, data,
-    // last_page, per_page, total, ...) — there is no meta wrapper. Reading
-    // result.data?.meta?.last_page (correct for the old, retired public
-    // catalog API) always evaluated to undefined here, silently capping
-    // every sync at page 1.
-    const lastPage = result.data?.last_page || 1;
+    const lastPage = result.data?.meta?.last_page || 1;
     if (page >= lastPage) return { ok: true };
     page += 1;
   }
 };
 
 // `updated_since` is deliberately never sent below — every cycle does a full
-// walk instead. This isn't just an optimization tradeoff: EasyGas's catalog
-// has no soft-deletes, so a deleted product can never appear in an
-// updated_since-filtered response at all (no row left to carry a timestamp).
-// Only a full pull lets syncProducts/syncCars detect and deactivate rows
-// that vanished (see the deactivation step at the end of each). The
-// sync_state checkpoint is still recorded for basic "when did this last run
-// successfully" visibility, but nothing reads it back to filter a request.
+// walk instead, simply because EasyGas's catalog contract documents no such
+// filter param on these endpoints (not invented here). The sync_state
+// checkpoint below is recorded purely for "when did this last run
+// successfully" visibility — nothing reads it back to filter a request, and
+// (per the architecture decision — see the file header) it's no longer used
+// to detect vanished rows either, since sync never auto-deactivates.
 const getSyncCheckpoint = async (pool, key) => {
   const [rows] = await pool.execute('SELECT last_synced_at FROM sync_state WHERE sync_key = ?', [key]);
   return rows[0]?.last_synced_at || null;
@@ -74,36 +135,46 @@ const setSyncCheckpoint = async (pool, key, when) => {
  * come directly from EasyGas, per the confirmed real /product-brands
  * response. Brands must come from EasyGas, never be locally invented (see
  * project architecture memory) — this upsert is the entire source of truth
- * for the `brands` table.
+ * for the `brands` table. Returns which of insert/update/unchanged happened,
+ * read off MySQL's own affectedRows for the ON DUPLICATE KEY UPDATE (see the
+ * STATUS DETAILS note in this file's header) — no extra query needed.
  */
 const upsertBrand = async (pool, brand) => {
-  if (!brand?.id || !brand?.name) return false;
-  await pool.execute(
+  if (!brand?.id || !brand?.name) return { outcome: 'skipped', reason: 'invalid_shape' };
+  const [result] = await pool.execute(
     `INSERT INTO brands (external_id, name, full_name, country, logo_url, synced_at)
      VALUES (?, ?, ?, ?, ?, NOW())
      ON DUPLICATE KEY UPDATE name = VALUES(name), full_name = VALUES(full_name),
        country = VALUES(country), logo_url = VALUES(logo_url), synced_at = VALUES(synced_at)`,
     [String(brand.id), brand.name, brand.full_name || null, brand.country || null, brand.logo || null]
   );
-  return true;
+  return { outcome: result.affectedRows === 1 ? 'inserted' : result.affectedRows === 2 ? 'updated' : 'unchanged' };
 };
 
 /**
  * Confirmed: /product-brands returns all 26 brands in one unpaginated
  * `{data: [...]}` response (no `meta`/`links` at all) — deliberately NOT
  * routed through walkPaginatedCatalog, kept as its own single-call function.
+ * Each brand's upsert is individually try/caught so one malformed row can't
+ * abort the rest of the batch — counts toward `failed` instead.
  */
 const syncBrands = async (pool) => {
   const result = await easyGasCatalogClient.getProductBrands();
   if (!result.ok) return { ok: false, reason: result.networkError ? 'network' : `http_${result.status}` };
   const rows = result.data?.data || (Array.isArray(result.data) ? result.data : []);
-  let imported = 0;
-  let skipped = 0;
+  const counts = { inserted: 0, updated: 0, skipped: 0, failed: 0 };
   for (const brand of rows) {
-    if (await upsertBrand(pool, brand)) imported += 1;
-    else skipped += 1;
+    try {
+      const { outcome } = await upsertBrand(pool, brand);
+      if (outcome === 'inserted') counts.inserted += 1;
+      else if (outcome === 'updated' || outcome === 'unchanged') counts.updated += 1;
+      else counts.skipped += 1;
+    } catch (error) {
+      counts.failed += 1;
+      console.warn(`[EasyGas Catalog Sync] Failed to upsert brand id=${brand?.id}: ${error.message}`);
+    }
   }
-  return { ok: true, imported, skipped, total: rows.length };
+  return { ok: true, ...counts, total: rows.length };
 };
 
 const resolveBrandById = async (pool, externalBrandId) => {
@@ -114,10 +185,14 @@ const resolveBrandById = async (pool, externalBrandId) => {
 
 // Confirmed real category field is product_category_id (+ product_category_name
 // for the human label) — component_type never existed in any real product.
-// Tracks which unmapped category ids have already been logged, so a category
-// EasyGas uses that we haven't whitelisted logs once for diagnosis, not every
-// sync cycle for every one of its products (the real catalog is EasyGas's
-// entire product line — oils, hoses, fittings, accessories, etc. all included).
+// CORRECTION to an earlier version of this comment: /public/api/products
+// does NOT pre-filter server-side — it returns EasyGas's entire product
+// line (confirmed live: 207 products across 15 categories). This is the
+// REAL, routine filtering mechanism (see config/externalCategoryMap.js's
+// header for the full live-verified breakdown) — a live pull hit this path
+// for 123 of 207 products (~59%), not a rare edge case. Tracks which
+// unmapped ids have already been logged so each of those categories logs
+// once for diagnosis, not once per product per sync cycle.
 const loggedUnmappedCategories = new Set();
 
 /**
@@ -180,7 +255,7 @@ const upsertProduct = async (pool, product) => {
         `— skipping this and every future product in this category.`
       );
     }
-    return { inserted: false, skipReason: 'category', categoryId: product.product_category_id, categoryName: product.product_category_name };
+    return { outcome: 'skipped', reason: 'category', categoryId: product.product_category_id, categoryName: product.product_category_name };
   }
   const brand = await resolveBrandById(pool, product.product_brand_id);
   if (!brand) {
@@ -188,18 +263,18 @@ const upsertProduct = async (pool, product) => {
       `[EasyGas Catalog Sync] Product ${product.id} references brand_id ${product.product_brand_id} ` +
       `(brand_name="${product.brand_name}") with no matching local brand — skipped, will retry once brands catch up`
     );
-    return { inserted: false, skipReason: 'brand' };
+    return { outcome: 'skipped', reason: 'brand' };
   }
   const model = deriveModel(product.name, brand.name);
   const fuelType = mapStationTypeToFuelType(product.station_type);
-  await pool.execute(
+  const [result] = await pool.execute(
     `INSERT INTO products (external_id, category, brand_id, brand, model, fuel_type, synced_at, is_active)
      VALUES (?, ?, ?, ?, ?, ?, NOW(), TRUE)
      ON DUPLICATE KEY UPDATE category = VALUES(category), brand_id = VALUES(brand_id), brand = VALUES(brand),
        model = VALUES(model), fuel_type = VALUES(fuel_type), synced_at = VALUES(synced_at), is_active = TRUE`,
     [String(product.id), category, brand.id, brand.name, model, fuelType]
   );
-  return { inserted: true };
+  return { outcome: result.affectedRows === 1 ? 'inserted' : result.affectedRows === 2 ? 'updated' : 'unchanged' };
 };
 
 const syncProducts = async (pool) => {
@@ -213,50 +288,43 @@ const syncProducts = async (pool) => {
   // parameter against stored TIMESTAMP values badly enough to mark every
   // just-synced row "stale" in the same cycle it was upserted.
   const [[{ startedAt }]] = await pool.execute('SELECT NOW() AS startedAt');
-  let imported = 0;
-  let skippedCategory = 0;
-  let skippedBrand = 0;
+  const counts = { inserted: 0, updated: 0, skipped: 0, failed: 0 };
   const unmappedCategories = new Map();
   const walk = await walkPaginatedCatalog(
     (page) => easyGasCatalogClient.getProducts({ page, per_page: PAGE_SIZE }),
     async (rows) => {
       for (const product of rows) {
-        const result = await upsertProduct(pool, product);
-        if (result.inserted) {
-          imported += 1;
-        } else if (result.skipReason === 'category') {
-          skippedCategory += 1;
-          const entry = unmappedCategories.get(result.categoryId) || { name: result.categoryName, count: 0 };
-          entry.count += 1;
-          unmappedCategories.set(result.categoryId, entry);
-        } else if (result.skipReason === 'brand') {
-          skippedBrand += 1;
+        try {
+          const result = await upsertProduct(pool, product);
+          if (result.outcome === 'inserted') {
+            counts.inserted += 1;
+          } else if (result.outcome === 'updated' || result.outcome === 'unchanged') {
+            counts.updated += 1;
+          } else if (result.outcome === 'skipped') {
+            counts.skipped += 1;
+            if (result.reason === 'category') {
+              const entry = unmappedCategories.get(result.categoryId) || { name: result.categoryName, count: 0 };
+              entry.count += 1;
+              unmappedCategories.set(result.categoryId, entry);
+            }
+          }
+        } catch (error) {
+          counts.failed += 1;
+          console.warn(`[EasyGas Catalog Sync] Failed to upsert product id=${product?.id}: ${error.message}`);
         }
       }
     }
   );
-  if (!walk.ok) return { ok: false };
+  if (!walk.ok) return { ok: false, reason: walk.reason };
 
-  // Deletion detection: EasyGas's catalog has no soft-deletes, so a deleted
-  // product simply never appears in this (or any) pull again — the only way
-  // to notice is a full walk that completed successfully (guaranteed above
-  // by `walk.ok`) finding a local, EasyGas-sourced row it never touched.
-  // Every row actually upserted this cycle got synced_at = NOW() (>=
-  // startedAt); anything older that's still marked active genuinely vanished.
-  // resolveEquipment already rejects an inactive product and
-  // productRepository.search already filters is_active = TRUE, so this alone
-  // is enough to stop a vanished product from being used in a new warranty.
-  await pool.execute(
-    'UPDATE products SET is_active = FALSE WHERE external_id IS NOT NULL AND is_active = TRUE AND synced_at < ?',
-    [startedAt]
-  );
+  // No deletion-detection step here by design — see the ARCHITECTURE
+  // DECISION note in this file's header. A product missing from a pull is no
+  // longer treated as evidence it was deleted; sync only ever inserts/updates.
 
   await setSyncCheckpoint(pool, 'products', startedAt);
   return {
     ok: true,
-    imported,
-    skippedCategory,
-    skippedBrand,
+    ...counts,
     unmappedCategories: [...unmappedCategories.entries()].map(([id, v]) => ({ id, name: v.name, count: v.count })),
   };
 };
@@ -264,48 +332,212 @@ const syncProducts = async (pool) => {
 /**
  * cars is its own upsert shape, not shared with upsertProduct — flat
  * brand/model strings (no brand_id FK, no category). Confirmed real fields
- * on the signed endpoint: id, brand_id (EasyGas's own, not resolved against
- * our brands table here — out of scope of this fix), brand_name, name,
- * updated_at — there is no separate `model` field, `name` carries it.
- * `is_active` reactivates on re-upsert (mirrors upsertProduct) so a car that
- * was deactivated by a past sync's deletion-detection step and later
- * reappears isn't stuck inactive forever.
+ * on the live endpoint: id, brand_id (EasyGas's own, not resolved against
+ * our brands table here — out of scope of this fix), brand_name, name —
+ * there is no separate `model` field, `name` carries it. CORRECTION to an
+ * earlier version of this comment: there is no `updated_at` field on the
+ * real object either (it listed one that doesn't exist — confirmed live,
+ * never read by this code anyway). `is_active` reactivates on re-upsert
+ * (mirrors upsertProduct) — harmless now that sync never deactivates a row
+ * itself (see the ARCHITECTURE DECISION note in this file's header), but
+ * kept as a safe default in case is_active was ever set FALSE some other way.
  */
 const upsertCar = async (pool, car) => {
-  if (!car?.id || !car?.brand_name || !car?.name) return false;
-  await pool.execute(
+  if (!car?.id || !car?.brand_name || !car?.name) return { outcome: 'skipped', reason: 'invalid_shape' };
+  const [result] = await pool.execute(
     `INSERT INTO cars (external_id, brand, model, synced_at, is_active)
      VALUES (?, ?, ?, NOW(), TRUE)
      ON DUPLICATE KEY UPDATE brand = VALUES(brand), model = VALUES(model), synced_at = VALUES(synced_at), is_active = TRUE`,
     [String(car.id), car.brand_name, car.name]
   );
-  return true;
+  return { outcome: result.affectedRows === 1 ? 'inserted' : result.affectedRows === 2 ? 'updated' : 'unchanged' };
 };
 
 const syncCars = async (pool) => {
   await getSyncCheckpoint(pool, 'cars'); // recorded for visibility only, see note above
   const [[{ startedAt }]] = await pool.execute('SELECT NOW() AS startedAt'); // see syncProducts for why not new Date()
-  let imported = 0;
-  let skipped = 0;
+  const counts = { inserted: 0, updated: 0, skipped: 0, failed: 0 };
+  // CORRECTION to an earlier version of this comment: a live call proved
+  // /public/api/cars ignores `page`/`per_page` entirely and always returns
+  // ALL cars (409, as of this correction) in one response with a plain
+  // `{data: [...]}` — no `meta`, no `links` at all, same unpaginated shape
+  // as /public/api/product-brands. It is NOT actually paginated, and
+  // `data` is a flat array of car objects, NOT an array of arrays (an
+  // earlier version of this comment claimed both of those incorrectly).
+  // Still routed through walkPaginatedCatalog rather than rewritten as a
+  // single call like syncBrands: with no `meta.last_page`, that helper's
+  // `result.data?.meta?.last_page || 1` fallback makes it stop after page 1
+  // — which is where everything already was, so this line has always
+  // fetched every car correctly (confirmed: 409 live vs 409 already synced),
+  // just for a different reason than originally documented. `.flat()` below
+  // is a no-op on a response that's already flat (Array.prototype.flat only
+  // descends into elements that are themselves arrays) — left in place as
+  // cheap insurance rather than restructuring this function, since it costs
+  // nothing today and would matter again if EasyGas's shape ever changes.
   const walk = await walkPaginatedCatalog(
     (page) => easyGasCatalogClient.getCars({ page, per_page: PAGE_SIZE }),
     async (rows) => {
-      for (const car of rows) {
-        if (await upsertCar(pool, car)) imported += 1;
-        else skipped += 1;
+      for (const car of rows.flat()) {
+        try {
+          const { outcome } = await upsertCar(pool, car);
+          if (outcome === 'inserted') counts.inserted += 1;
+          else if (outcome === 'updated' || outcome === 'unchanged') counts.updated += 1;
+          else counts.skipped += 1;
+        } catch (error) {
+          counts.failed += 1;
+          console.warn(`[EasyGas Catalog Sync] Failed to upsert car id=${car?.id}: ${error.message}`);
+        }
       }
     }
   );
-  if (!walk.ok) return { ok: false };
+  if (!walk.ok) return { ok: false, reason: walk.reason };
 
-  // Deletion detection — same reasoning as syncProducts above.
-  await pool.execute(
-    'UPDATE cars SET is_active = FALSE WHERE external_id IS NOT NULL AND is_active = TRUE AND synced_at < ?',
-    [startedAt]
-  );
+  // No deletion-detection step here either — same reasoning as syncProducts above.
 
   await setSyncCheckpoint(pool, 'cars', startedAt);
-  return { ok: true, imported, skipped };
+  return { ok: true, ...counts };
 };
 
-module.exports = { syncBrands, syncProducts, syncCars };
+/**
+ * Persists the outcome of one runFullSync call so the admin UI's Last Sync
+ * Time/Status/Message survives a page reload without re-running the sync —
+ * reuses sync_state (see config/database.js) with a dedicated sync_key
+ * distinct from the per-entity 'products'/'cars' checkpoint rows above.
+ * `details` is only ever populated on SUCCESS; NULL on FAILED (no partial
+ * counts are reported — see runFullSync). Also doubles as the lock release:
+ * writing a real last_status (SUCCESS/FAILED) here overwrites whatever
+ * acquireSyncLock set it to (RUNNING).
+ */
+const recordSyncSummary = async (pool, { status, message, details, durationMs }) => {
+  await pool.execute(
+    `INSERT INTO sync_state (sync_key, last_synced_at, last_status, last_message, last_details, last_duration_ms)
+     VALUES ('catalog', NOW(), ?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE last_synced_at = VALUES(last_synced_at), last_status = VALUES(last_status),
+       last_message = VALUES(last_message), last_details = VALUES(last_details), last_duration_ms = VALUES(last_duration_ms)`,
+    [status, message, details ? JSON.stringify(details) : null, durationMs ?? null]
+  );
+};
+
+/** Reads back the last runFullSync outcome — used by GET /api/catalog-sync/status
+ * so the admin UI can show Never Synced/Running/Success/Failed, Last Sync
+ * Time, Last Duration, and the per-entity breakdown on page load without
+ * triggering a new sync. Returns nulls (never throws) if no sync has ever run. */
+const getSyncSummary = async (pool) => {
+  const [rows] = await pool.execute(
+    'SELECT last_synced_at, last_status, last_message, last_details, last_duration_ms FROM sync_state WHERE sync_key = ?',
+    ['catalog']
+  );
+  const row = rows[0];
+  return {
+    lastSyncedAt: row?.last_synced_at || null,
+    status: row?.last_status || null,
+    message: row?.last_message || null,
+    details: row?.last_details || null, // mysql2 auto-parses the JSON column
+    durationMs: row?.last_duration_ms ?? null,
+  };
+};
+
+// A real full sync takes seconds; this is purely a crash-recovery safety
+// net (see acquireSyncLock) — if the process dies mid-sync, the lock
+// self-heals after this many minutes instead of being stuck forever.
+const SYNC_LOCK_STALE_MINUTES = 15;
+
+/**
+ * Atomically claims the 'catalog' sync_state row so runFullSync can never
+ * execute twice concurrently (see the LOCKING note in this file's header).
+ * Single UPDATE...WHERE is the primary path — InnoDB's row lock makes two
+ * near-simultaneous claims serialize, so only one can match the WHERE
+ * clause and flip the row to RUNNING; the loser sees affectedRows === 0.
+ * The INSERT fallback only exists for the very first sync ever (no row to
+ * UPDATE yet); a duplicate-key error there just means another request won
+ * that exact first-run race.
+ */
+const acquireSyncLock = async (pool) => {
+  const [updateResult] = await pool.execute(
+    `UPDATE sync_state SET last_status = 'RUNNING', sync_lock_acquired_at = NOW()
+     WHERE sync_key = 'catalog'
+       AND (last_status IS NULL OR last_status != 'RUNNING' OR sync_lock_acquired_at < NOW() - INTERVAL ? MINUTE)`,
+    [SYNC_LOCK_STALE_MINUTES]
+  );
+  if (updateResult.affectedRows > 0) return true;
+
+  try {
+    await pool.execute(
+      `INSERT INTO sync_state (sync_key, last_status, sync_lock_acquired_at) VALUES ('catalog', 'RUNNING', NOW())`
+    );
+    return true;
+  } catch (error) {
+    if (error.code === 'ER_DUP_ENTRY') return false;
+    throw error;
+  }
+};
+
+/**
+ * The ONE synchronization job — everything the admin "Sync EasyGas Catalog"
+ * entry point (routes/catalogSyncRoutes.js) and the periodic sweep
+ * (easyGasCatalogSyncSweep.js) both run, so Last Sync Time/Status/Message
+ * reflects whichever triggered it most recently. Brands always run first —
+ * products.brand_id's FK needs the referenced brand to already exist locally
+ * before a product upsert can resolve it (see upsertProduct/resolveBrandById).
+ * If brands fails, products/cars are skipped entirely for this run (same
+ * short-circuit the sweep used before this refactor) rather than upserting
+ * against a stale/incomplete brand list. If brands succeeds but products
+ * and/or cars fail, the run is still reported FAILED overall — no partial
+ * `details` counts are recorded, since "partially synced" isn't one of the
+ * three states (SUCCESS/FAILED/RUNNING) sync_state.last_status models; the
+ * per-entity skip/import counts are still logged to the console either way.
+ *
+ * Returns `{ conflict: true, status: 'RUNNING', ... }` immediately, without
+ * touching sync_state at all, if another run is already in progress — see
+ * acquireSyncLock. The `try/catch` around the actual sync work exists solely
+ * so an unexpected exception (not a modeled EasyGas network/HTTP failure —
+ * those already return {ok:false} from syncBrands/syncProducts/syncCars)
+ * still releases the lock via recordSyncSummary instead of leaving it
+ * wedged on RUNNING until the stale-lock timeout.
+ */
+const runFullSync = async (pool) => {
+  const locked = await acquireSyncLock(pool);
+  if (!locked) {
+    return { ok: false, conflict: true, status: 'RUNNING', message: 'already_running', details: null };
+  }
+
+  const startedAtMs = Date.now();
+  try {
+    const brandsResult = await syncBrands(pool);
+    if (!brandsResult.ok) {
+      const summary = { status: 'FAILED', message: `brands_failed:${brandsResult.reason}`, details: null, durationMs: Date.now() - startedAtMs };
+      await recordSyncSummary(pool, summary);
+      return { ok: false, ...summary, brandsResult, productsResult: null, carsResult: null };
+    }
+
+    const productsResult = await syncProducts(pool);
+    const carsResult = await syncCars(pool);
+
+    const failures = [];
+    if (!productsResult.ok) failures.push(`products_failed:${productsResult.reason || 'unknown'}`);
+    if (!carsResult.ok) failures.push(`cars_failed:${carsResult.reason || 'unknown'}`);
+
+    const durationMs = Date.now() - startedAtMs;
+    const summary = failures.length === 0
+      ? {
+          status: 'SUCCESS',
+          message: 'success',
+          durationMs,
+          details: {
+            products: { inserted: productsResult.inserted, updated: productsResult.updated, skipped: productsResult.skipped, failed: productsResult.failed },
+            brands: { inserted: brandsResult.inserted, updated: brandsResult.updated, skipped: brandsResult.skipped, failed: brandsResult.failed },
+            cars: { inserted: carsResult.inserted, updated: carsResult.updated, skipped: carsResult.skipped, failed: carsResult.failed },
+          },
+        }
+      : { status: 'FAILED', message: failures.join(';'), details: null, durationMs };
+
+    await recordSyncSummary(pool, summary);
+    return { ok: failures.length === 0, ...summary, brandsResult, productsResult, carsResult };
+  } catch (error) {
+    const summary = { status: 'FAILED', message: `unexpected:${error.message}`.slice(0, 500), details: null, durationMs: Date.now() - startedAtMs };
+    await recordSyncSummary(pool, summary);
+    return { ok: false, ...summary };
+  }
+};
+
+module.exports = { syncBrands, syncProducts, syncCars, runFullSync, getSyncSummary };

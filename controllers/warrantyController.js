@@ -127,6 +127,72 @@ const rejectManualVerification = async (req, res, next) => {
 };
 
 /**
+ * Warranty status workflow — admin review of the warranty form itself, a
+ * separate concept from approveManualVerification/rejectManualVerification
+ * above (which review one equipment row's barcode identity). Same shape:
+ * read the service's typed AppError and translate it, never a raw 500.
+ *
+ * Awaits the FULL service call — including the EasyGas sync it triggers on
+ * SUCCESSFUL — before releasing the connection in `finally`, even though
+ * the sync itself acquires its own separate connection internally (see
+ * easyGasWarrantySyncService.syncWarrantyForm). This request's response
+ * only returns once sync has been attempted and its outcome recorded, so
+ * the admin sees the real result immediately rather than a status that
+ * might still change moments later.
+ */
+const approveWarrantyForm = async (req, res, next) => {
+  let connection;
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, message: errors.array()[0].msg, errorCode: 'VALIDATION_ERROR', timestamp: new Date().toISOString() });
+    }
+    const { formId } = req.params;
+    connection = await pool.getConnection();
+    await warrantyService.reviewWarrantyForm(connection, formId, req.user.id, {
+      decision: 'SUCCESSFUL',
+      notes: req.body.notes,
+    });
+    const updatedForm = await warrantyRepository.findDetailById(connection, formId);
+    const [withEquipment] = await attachEquipment(connection, [updatedForm]);
+    res.json(toWarrantyResponse(withEquipment));
+  } catch (error) {
+    if (error instanceof AppError) {
+      return sendAppError(res, error);
+    }
+    next(error);
+  } finally {
+    if (connection) connection.release();
+  }
+};
+
+const rejectWarrantyForm = async (req, res, next) => {
+  let connection;
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, message: errors.array()[0].msg, errorCode: 'VALIDATION_ERROR', timestamp: new Date().toISOString() });
+    }
+    const { formId } = req.params;
+    connection = await pool.getConnection();
+    await warrantyService.reviewWarrantyForm(connection, formId, req.user.id, {
+      decision: 'REJECTED',
+      notes: req.body.notes,
+    });
+    const updatedForm = await warrantyRepository.findDetailById(connection, formId);
+    const [withEquipment] = await attachEquipment(connection, [updatedForm]);
+    res.json(toWarrantyResponse(withEquipment));
+  } catch (error) {
+    if (error instanceof AppError) {
+      return sendAppError(res, error);
+    }
+    next(error);
+  } finally {
+    if (connection) connection.release();
+  }
+};
+
+/**
  * Pre-upload endpoint for a Manual Verification equipment photo — installer-
  * authenticated (any role, not ADMIN-gated; see routes), multipart, one
  * file. Deliberately decoupled from the warranty create/update JSON body,
@@ -342,6 +408,8 @@ module.exports = {
   getMyWarrantyForms,
   approveManualVerification,
   rejectManualVerification,
+  approveWarrantyForm,
+  rejectWarrantyForm,
   uploadEquipmentPhoto,
   streamEquipmentPhoto,
 };

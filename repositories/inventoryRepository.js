@@ -17,21 +17,29 @@ const findByBarcode = async (connection, barcode) => {
   return rows[0] || null;
 };
 
+// Shared by every chunked bulk operation below. A single un-chunked
+// IN(...) exceeds MySQL's prepared-statement placeholder ceiling (65,535 —
+// confirmed empirically: 65,535 succeeds, 70,000 throws "Prepared statement
+// contains too many placeholders") on a large CSV import; a per-row insert
+// loop doesn't scale either. Chunked multi-row statements avoid both.
+const CHUNK_SIZE = 500;
+
 const findExistingBarcodes = async (connection, barcodes) => {
-  if (barcodes.length === 0) return new Set();
-  const placeholders = barcodes.map(() => '?').join(',');
-  const [rows] = await connection.execute(
-    `SELECT barcode FROM inventory_items WHERE barcode IN (${placeholders})`,
-    barcodes
-  );
-  return new Set(rows.map((r) => r.barcode));
+  const existing = new Set();
+  for (let i = 0; i < barcodes.length; i += CHUNK_SIZE) {
+    const chunk = barcodes.slice(i, i + CHUNK_SIZE);
+    const placeholders = chunk.map(() => '?').join(',');
+    const [rows] = await connection.execute(
+      `SELECT barcode FROM inventory_items WHERE barcode IN (${placeholders})`,
+      chunk
+    );
+    rows.forEach((r) => existing.add(r.barcode));
+  }
+  return existing;
 };
 
-// A per-row insert loop does not scale to the "hundreds or thousands" of
-// barcodes a real CSV import contains — chunked multi-row INSERT instead.
 // branchId ("warehouse", Phase 4) is nullable, same as before — existing
 // imports that don't specify one keep working exactly as they always did.
-const CHUNK_SIZE = 500;
 const bulkInsert = async (connection, { productId, barcodes, importBatchId, branchId }) => {
   for (let i = 0; i < barcodes.length; i += CHUNK_SIZE) {
     const chunk = barcodes.slice(i, i + CHUNK_SIZE);

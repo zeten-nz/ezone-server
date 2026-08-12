@@ -10,6 +10,8 @@ const {
   getMyWarrantyForms,
   approveManualVerification,
   rejectManualVerification,
+  approveWarrantyForm,
+  rejectWarrantyForm,
   uploadEquipmentPhoto,
   streamEquipmentPhoto,
 } = require('../controllers/warrantyController');
@@ -95,6 +97,13 @@ const manualVerificationReviewRules = [
   body('notes').optional({ checkFalsy: true }).isLength({ max: 1000 }),
 ];
 
+// Warranty status workflow — admin review of the warranty form itself, a
+// separate action from manualVerificationReviewRules above. Same shape
+// (notes optional either way).
+const warrantyReviewRules = [
+  body('notes').optional({ checkFalsy: true }).isLength({ max: 1000 }),
+];
+
 router.post('/', verifyToken, warrantyValidationRules, createWarrantyForm);
 
 // Literal-string routes must come before /:formId to avoid Express treating them as IDs.
@@ -113,6 +122,13 @@ router.delete('/:formId', verifyToken, authorizeRole('ADMIN'), deleteWarrantyFor
 // other review/approval action in this app (registration requests).
 router.post('/equipment/:equipmentId/approve-verification', verifyToken, authorizeRole('ADMIN'), manualVerificationReviewRules, approveManualVerification);
 router.post('/equipment/:equipmentId/reject-verification', verifyToken, authorizeRole('ADMIN'), manualVerificationReviewRules, rejectManualVerification);
+
+// Warranty status workflow — admin reviews the warranty form itself
+// (PENDING -> SUCCESSFUL/REJECTED). ADMIN-only, same as every other
+// review/approval action in this app. Approving triggers the EasyGas sync
+// exactly once, inside warrantyService.reviewWarrantyForm — never here.
+router.post('/:formId/approve', verifyToken, authorizeRole('ADMIN'), warrantyReviewRules, approveWarrantyForm);
+router.post('/:formId/reject', verifyToken, authorizeRole('ADMIN'), warrantyReviewRules, rejectWarrantyForm);
 
 // Pre-upload endpoint for a Manual Verification equipment photo — any
 // authenticated installer (uploaded mid-form-fill, before the warranty row
