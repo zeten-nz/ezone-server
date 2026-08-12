@@ -17,6 +17,7 @@ const { toWarrantyListResponse } = require('../dtos/warrantyDTO');
 const { normalizePhone } = require('../utils/phoneFormat');
 
 const getWarrantiesByPhone = async (req, res, next) => {
+  let connection;
   try {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
@@ -24,15 +25,16 @@ const getWarrantiesByPhone = async (req, res, next) => {
     }
 
     const phone = normalizePhone(req.body.phone);
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
 
     const rows = await warrantyRepository.findByOwnerPhone(connection, phone);
     const forms = await attachEquipment(connection, rows);
-    connection.release();
 
     res.json(toWarrantyListResponse(forms));
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 

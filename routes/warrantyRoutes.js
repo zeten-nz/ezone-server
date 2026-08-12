@@ -17,6 +17,7 @@ const {
 } = require('../controllers/warrantyController');
 const { verifyToken, authorizeRole } = require('../middleware/auth');
 const { handleManualVerificationPhotoUpload } = require('../config/uploads');
+const { PHONE_REGEX } = require('../config/validation');
 
 const router = express.Router();
 
@@ -64,7 +65,13 @@ const warrantyValidationRules = [
   body('vehicle_vin').notEmpty(),
   body('vehicle_mileage').isInt({ min: 0, max: 4294967295 }).withMessage('vehicle_mileage must be between 0 and 4294967295'),
   body('owner_full_name').notEmpty(),
-  body('owner_phone').notEmpty(),
+  // +998XXXXXXXXX exactly — EasyGas rejects other shapes, and this value is
+  // forwarded verbatim in the warranty payload on approval (see
+  // easyGasWarrantySyncService.buildPayload). Same shared PHONE_REGEX
+  // authRoutes already enforces for registration; rows created before this
+  // rule are additionally guarded at sync time (syncWarrantyForm's pre-POST
+  // phone check) so a legacy shape can still never reach EasyGas.
+  body('owner_phone').notEmpty().matches(PHONE_REGEX).withMessage('A valid Uzbekistan phone number is required (+998XXXXXXXXX)'),
   // Exactly the 4 fixed equipment slots (Reducer/Cylinder/Controller/
   // Injector Rail) — completeness (all 4, no duplicates) and product
   // validity are enforced in warrantyService.resolveEquipment, since a

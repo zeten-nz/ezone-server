@@ -60,6 +60,49 @@ const validateEnv = () => {
     );
   }
 
+  // ── EasyGas integration configuration ──────────────────────────────────
+  // The warranty POST and catalog sync both sign with EASYGAS_SHARED_SECRET
+  // against EASYGAS_WARRANTY_API_BASE_URL. A placeholder secret produces
+  // invalid signatures against the real API, so in production a known-bad
+  // EasyGas configuration is a hard startup failure (a live integration
+  // silently signing everything wrong is worse than not starting). In
+  // development it stays a warning — the EasyGas clients already degrade
+  // gracefully (normalized failures, never throws), so local work without
+  // real credentials remains possible. The secret's VALUE is never printed
+  // here or anywhere else — only what kind of problem it has.
+  const easyGasProblems = [];
+  const easyGasSecret = process.env.EASYGAS_SHARED_SECRET;
+  if (!easyGasSecret) {
+    easyGasProblems.push('EASYGAS_SHARED_SECRET is missing');
+  } else if (/CHANGE_ME|PLACEHOLDER|YOUR_SECRET|REPLACE/i.test(easyGasSecret)) {
+    easyGasProblems.push('EASYGAS_SHARED_SECRET is still a placeholder value');
+  }
+  const easyGasUrl = process.env.EASYGAS_WARRANTY_API_BASE_URL;
+  if (!easyGasUrl) {
+    easyGasProblems.push('EASYGAS_WARRANTY_API_BASE_URL is missing');
+  } else {
+    try {
+      new URL(easyGasUrl);
+    } catch {
+      easyGasProblems.push('EASYGAS_WARRANTY_API_BASE_URL is not a valid URL');
+    }
+  }
+  if (easyGasProblems.length > 0) {
+    if (process.env.NODE_ENV === 'production') {
+      console.error(
+        `[STARTUP ERROR] EasyGas configuration is invalid: ${easyGasProblems.join('; ')}.\n` +
+        '[STARTUP ERROR] Refusing to start in production with a broken EasyGas integration — ' +
+        'set the real values (obtained from EasyGas) in .env and restart.'
+      );
+      process.exit(1);
+    }
+    console.warn(
+      `[STARTUP WARNING] EasyGas configuration is invalid: ${easyGasProblems.join('; ')}. ` +
+      'EasyGas warranty submission and catalog sync will fail until this is fixed ' +
+      '(fatal at startup when NODE_ENV=production).'
+    );
+  }
+
   console.log('[STARTUP] Environment variables validated successfully.');
 };
 

@@ -58,12 +58,14 @@ const request = async (method, path) => {
 const getProducts = (params) => request('GET', `/public/api/products${toQueryString(params)}`);
 const getProductBrands = (params) => request('GET', `/public/api/product-brands${toQueryString(params)}`);
 const getCars = (params) => request('GET', `/public/api/cars${toQueryString(params)}`);
-// Branches endpoint — NOT part of this update (out of scope: the task that
-// produced this change only confirmed /public/api/products,
-// /public/api/product-brands, and /public/api/cars). Left unchanged from
-// its prior path (still unconfirmed against the new API) and still not
-// wired into easyGasCatalogSyncService.js/easyGasCatalogSyncSweep.js —
-// branches.easygas_stag_code remains a manually ops-entered value.
+// Branches endpoint — deliberately NEVER wired into any sync (FINAL
+// architecture decision: LOCAL branches are authoritative; branch_stag_code
+// comes from our own branches.code, and no EasyGas branch synchronization
+// exists or will be added — see easyGasWarrantySyncService.js's
+// branch_stag_code note). This function is dead-but-harmless: kept only so
+// the exported client surface doesn't change, path unconfirmed against the
+// current API (a /branches probe 404s; /public/api/branches 401s — neither
+// is used). Do not wire it into a sync without revisiting that decision.
 const getBranches = (params) => request('GET', `/branches${toQueryString(params)}`);
 
 module.exports = { getProducts, getProductBrands, getCars, getBranches };

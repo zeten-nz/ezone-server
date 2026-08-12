@@ -4,8 +4,9 @@ const { pool } = require('../config/database');
 const { UPLOAD_DIR, PROFILE_UPLOAD_DIR } = require('../config/uploads');
 
 const getAllRegistrationRequests = async (req, res, next) => {
+  let connection;
   try {
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
 
     const [requests] = await connection.execute(
       `SELECT rr.id, rr.first_name, rr.last_name, rr.region, rr.district, rr.branch_code,
@@ -18,17 +19,19 @@ const getAllRegistrationRequests = async (req, res, next) => {
        ORDER BY rr.created_at DESC`
     );
 
-    connection.release();
     res.json(requests);
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 
 const getRegistrationRequestDetail = async (req, res, next) => {
+  let connection;
   try {
     const { id } = req.params;
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
 
     const [requests] = await connection.execute(
       `SELECT rr.id, rr.first_name, rr.last_name, rr.region, rr.district, rr.branch_code,
@@ -42,8 +45,6 @@ const getRegistrationRequestDetail = async (req, res, next) => {
       [id]
     );
 
-    connection.release();
-
     if (requests.length === 0) {
       return res.status(404).json({ success: false, message: 'Registration request not found', errorCode: 'NOT_FOUND', timestamp: new Date().toISOString() });
     }
@@ -51,6 +52,8 @@ const getRegistrationRequestDetail = async (req, res, next) => {
     res.json(requests[0]);
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 
@@ -61,16 +64,15 @@ const getRegistrationRequestDetail = async (req, res, next) => {
  * fetchable by anyone with the URL.
  */
 const streamRegistrationPhoto = async (req, res, next) => {
+  let connection;
   try {
     const { id } = req.params;
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
 
     const [requests] = await connection.execute(
       'SELECT photo_filename FROM registration_requests WHERE id = ?',
       [id]
     );
-
-    connection.release();
 
     if (requests.length === 0) {
       return res.status(404).json({ success: false, message: 'Registration request not found', errorCode: 'NOT_FOUND', timestamp: new Date().toISOString() });
@@ -111,6 +113,8 @@ const streamRegistrationPhoto = async (req, res, next) => {
     stream.pipe(res);
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 
@@ -205,11 +209,12 @@ const approveRegistrationRequest = async (req, res, next) => {
 };
 
 const rejectRegistrationRequest = async (req, res, next) => {
+  let connection;
   try {
     const { id } = req.params;
     const { notes } = req.body;
 
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
 
     const [requests] = await connection.execute(
       'SELECT status FROM registration_requests WHERE id = ?',
@@ -217,12 +222,10 @@ const rejectRegistrationRequest = async (req, res, next) => {
     );
 
     if (requests.length === 0) {
-      connection.release();
       return res.status(404).json({ success: false, message: 'Registration request not found', errorCode: 'NOT_FOUND', timestamp: new Date().toISOString() });
     }
 
     if (requests[0].status !== 'PENDING') {
-      connection.release();
       return res.status(409).json({ success: false, message: 'This request has already been reviewed', errorCode: 'INVALID_STATE', timestamp: new Date().toISOString() });
     }
 
@@ -237,8 +240,6 @@ const rejectRegistrationRequest = async (req, res, next) => {
       ['REJECTED', notes?.trim() || null, req.user.id, id, 'PENDING']
     );
 
-    connection.release();
-
     if (updateResult.affectedRows === 0) {
       return res.status(409).json({ success: false, message: 'This request has already been reviewed', errorCode: 'INVALID_STATE', timestamp: new Date().toISOString() });
     }
@@ -246,6 +247,8 @@ const rejectRegistrationRequest = async (req, res, next) => {
     res.json({ message: 'Registration request rejected' });
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 

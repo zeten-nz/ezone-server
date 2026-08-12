@@ -237,11 +237,11 @@ const uploadEquipmentPhoto = async (req, res, next) => {
  * PII, same class of concern as a registration applicant's photo).
  */
 const streamEquipmentPhoto = async (req, res, next) => {
+  let connection;
   try {
     const { equipmentId } = req.params;
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
     const equipmentRow = await equipmentRepository.findById(connection, equipmentId);
-    connection.release();
 
     if (!equipmentRow || !equipmentRow.manual_verification_photo_filename) {
       return res.status(404).json({ success: false, message: 'Photo not found', errorCode: 'NOT_FOUND', timestamp: new Date().toISOString() });
@@ -280,6 +280,10 @@ const streamEquipmentPhoto = async (req, res, next) => {
     stream.pipe(res);
   } catch (error) {
     next(error);
+  } finally {
+    // Only the findById SELECT needs the connection — released here (right
+    // after pipe() is wired up), never held for the file stream itself.
+    if (connection) connection.release();
   }
 };
 
@@ -301,6 +305,7 @@ const deleteWarrantyForm = async (req, res, next) => {
 };
 
 const getAllWarrantyForms = async (req, res, next) => {
+  let connection;
   try {
     const page   = Math.max(1, parseInt(req.query.page,  10) || 1);
     const limit  = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
@@ -316,10 +321,9 @@ const getAllWarrantyForms = async (req, res, next) => {
     const verificationStatus = req.query.verificationStatus || undefined;
     const offset = (page - 1) * limit;
 
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
     const { rows, total } = await warrantyRepository.findAllPaginated(connection, { limit, offset, search, employeeId, verificationStatus });
     const forms = await attachEquipment(connection, rows);
-    connection.release();
 
     const totalPages = Math.ceil(total / limit);
     res.json({
@@ -332,45 +336,51 @@ const getAllWarrantyForms = async (req, res, next) => {
     });
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 
 const getWarrantyFormDetail = async (req, res, next) => {
+  let connection;
   try {
     const { formId } = req.params;
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
 
     const form = await warrantyRepository.findDetailById(connection, formId);
     if (!form) {
-      connection.release();
       return res.status(404).json({ success: false, message: 'Warranty form not found', errorCode: 'NOT_FOUND', timestamp: new Date().toISOString() });
     }
 
     const [withEquipment] = await attachEquipment(connection, [form]);
-    connection.release();
 
     res.json(toWarrantyResponse(withEquipment));
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 
 const searchWarrantyForms = async (req, res, next) => {
+  let connection;
   try {
     const { search, filterType } = req.query;
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
 
     const rows = await warrantyRepository.searchForms(connection, { search, filterType });
     const forms = await attachEquipment(connection, rows);
-    connection.release();
 
     res.json(toWarrantyListResponse(forms));
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 
 const getMyWarrantyForms = async (req, res, next) => {
+  let connection;
   try {
     // Always use the authenticated user's ID — never accept employeeId from query params.
     const employeeId = req.user.id;
@@ -379,10 +389,9 @@ const getMyWarrantyForms = async (req, res, next) => {
     const search = (req.query.search || '').trim();
     const offset = (page - 1) * limit;
 
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
     const { rows, total } = await warrantyRepository.findMinePaginated(connection, employeeId, { limit, offset, search });
     const forms = await attachEquipment(connection, rows);
-    connection.release();
 
     const totalPages = Math.ceil(total / limit);
     res.json({
@@ -395,6 +404,8 @@ const getMyWarrantyForms = async (req, res, next) => {
     });
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 

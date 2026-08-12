@@ -6,38 +6,43 @@
  * in the standalone test-easygas.js verification, applied to a real
  * warranty row instead of a fabricated sample.
  *
- * Two fields are known-uncertain, not invented — both documented at the
- * exact line that uses them below:
- *   - branch_stag_code: no fully reliable source exists in this schema.
- *     branches.easygas_stag_code is unpopulated for every row (confirmed —
- *     see the investigation this note was updated from) and is a documented
- *     dead column slated for removal (migrations/phase2-drop-easygas-schema.js).
- *     Falls back to installer_branch_code (a snapshot of branches.code),
- *     which IS the real EasyGas-issued STAG code for the 259 branches
- *     migrated directly from stag-db/branches.sql's own `stag_code` field
- *     (confirmed 1:1 against that source file — not a coincidence for those
- *     rows) — but is a locally-invented placeholder ("STAG_001", "STAG_015",
- *     "STAG_022") for exactly 3 branches that do not appear anywhere in that
- *     source dump, at least 2 of which currently have real installers
- *     assigned. Sending one of those 3 codes to EasyGas will not match a
- *     real STAG branch. No reliable source for those 3 exists in this
- *     codebase today — not fixed here (out of scope: needs either a real
- *     easygas_stag_code from EasyGas, or their /public/api/branches endpoint,
- *     confirmed to exist but not confirmed in shape — see the investigation
- *     this note was updated from for how that was established).
- *   - components[].product_id: ambiguous whether EasyGas wants our local
- *     products.id or their own catalog id (products.external_id). Prefers
- *     external_id when known, falls back to our local id otherwise.
+ * Field-source decisions, documented at the exact line that uses each below:
+ *   - branch_stag_code: LOCAL branches are authoritative (FINAL architecture
+ *     decision — no EasyGas branch sync exists or will be added, and
+ *     branches.easygas_stag_code is a dead column slated for removal, never
+ *     read). The value sent is warranty_forms.installer_branch_code — a
+ *     snapshot of the installer's branch's own branches.code, copied by
+ *     getEmployeeSnapshot at warranty CREATION time and immutable afterward
+ *     (deliberately: re-resolving via the employee's CURRENT branch at
+ *     approval time would mis-attribute the warranty if the employee changed
+ *     branches between creation and approval). A real POST has confirmed
+ *     EasyGas accepts these codes verbatim (e.g. "01/1"). Known data caveat,
+ *     deliberately NOT worked around in code: 3 legacy branches (STAG_001/
+ *     STAG_015/STAG_022) carry locally-invented codes EasyGas never issued —
+ *     a submission from one of them will be rejected by EasyGas and that
+ *     failure is recorded and surfaced normally, never hidden or faked.
+ *   - components[].product_id: EasyGas's own catalog id — prefers the synced
+ *     products.external_id, local-id fallback only when external_id is
+ *     absent (documented fallback, not the norm).
  *   - car_id: same resolution as product_id, added when it was discovered
  *     this field was still sending the raw local `cars.id` (an internal
  *     auto-increment PK EasyGas has never seen) instead of the synced
- *     `cars.external_id` — see resolveCarExternalId below.
+ *     `cars.external_id`.
+ *   - owner_phone / organization_phone: canonicalized formatting-only
+ *     (toEasyGasPhone) then validated against EasyGas's +998XXXXXXXXX shape
+ *     immediately before the POST (see the guard in syncWarrantyForm) —
+ *     every real branches.phone is stored with human spacing, and
+ *     historical owner_phone rows predating creation-time validation hold
+ *     other shapes (see utils/phoneFormat.js); a value that can't be
+ *     canonicalized without guessing fails the sync cleanly rather than
+ *     reach EasyGas. Stored data is never rewritten.
  */
 
 const warrantyRepository = require('../repositories/warrantyRepository');
 const carRepository = require('../repositories/carRepository');
 const { attachEquipment } = require('../utils/warrantyEquipment');
 const easyGasWarrantyClient = require('./easyGasWarrantyClient');
+const { PHONE_REGEX } = require('../config/validation');
 
 const COMPONENT_TYPE_MAP = {
   REDUCER: 'reducer',
@@ -65,6 +70,34 @@ const toDateOnly = (value) => {
   if (!value) return null;
   const date = value instanceof Date ? value : new Date(value);
   return isNaN(date) ? null : date.toISOString().slice(0, 10);
+};
+
+/**
+ * Formatting-only canonicalization of a phone number for the EasyGas
+ * payload — returns the '+998XXXXXXXXX' form, or null if the value can't
+ * reach that shape without guessing. Stored data is NEVER rewritten; this
+ * runs only on the outbound copy.
+ *
+ * Why normalization exists at all: EVERY active branch's branches.phone is
+ * stored with human formatting ('+998 XX XXX XX XX' — confirmed 259/259
+ * populated rows), and EasyGas verifiably accepted that spaced shape in the
+ * real 201-Created contract test. Validating the raw stored value against
+ * the strict regex would therefore fail 100% of syncs for a
+ * formatting-only difference. So: strip formatting characters (spaces,
+ * dashes, parentheses — nothing else), accept '+998…' as-is, and add only
+ * the '+' sign when the full '998…' country-coded number is already there.
+ * A bare 9-digit national number is deliberately REJECTED, not auto-prefixed
+ * — prepending a country code to a number that never carried one is exactly
+ * the "blind +998 prepend" this codebase's history warns against (see
+ * utils/phoneFormat.js — that utility reduces to 9 digits for COMPARISON
+ * and is intentionally not reused here, since sending a 9-digit reduction
+ * would discard the '+998' EasyGas requires).
+ */
+const toEasyGasPhone = (value) => {
+  const stripped = String(value || '').replace(/[\s\-()]/g, '');
+  if (/^\+998\d{9}$/.test(stripped)) return stripped;
+  if (/^998\d{9}$/.test(stripped)) return `+${stripped}`;
+  return null;
 };
 
 const buildPayload = (form, equipment, carExternalId) => ({
@@ -128,7 +161,37 @@ const syncWarrantyForm = async (pool, formId) => {
     // query, which many unrelated warranty read paths also depend on.
     const car = form.car_id ? await carRepository.findById(connection, form.car_id) : null;
     const carExternalId = car?.external_id != null ? Number(car.external_id) : null;
-    const rawBody = JSON.stringify(buildPayload(form, withEquipment.equipment, carExternalId)); // serialized exactly once
+
+    // Pre-POST phone guard — the payload's phones must be +998XXXXXXXXX
+    // exactly (same PHONE_REGEX authRoutes already enforces for
+    // registration). Each is canonicalized formatting-only first (see
+    // toEasyGasPhone — stored branch/warranty data is never rewritten) and
+    // validated after: new warranties' owner_phone is already strict at
+    // creation (warrantyRoutes), but rows created before that rule — and
+    // organization_phone, a snapshot of branches.phone that is stored with
+    // human spacing in every real row — can hold other shapes. Anything
+    // that can't be canonicalized without guessing fails the sync cleanly
+    // here, never reaching EasyGas: recorded as FAILED with a
+    // machine-readable `invalid_phone:` prefix (surfaced to the admin via
+    // easygas_sync_error, same as every other sync failure), no POST sent.
+    const ownerPhone = toEasyGasPhone(form.owner_phone);
+    const organizationPhone = toEasyGasPhone(form.organization_phone);
+    const invalidPhones = [];
+    if (!ownerPhone || !PHONE_REGEX.test(ownerPhone)) invalidPhones.push('owner_phone');
+    if (!organizationPhone || !PHONE_REGEX.test(organizationPhone)) invalidPhones.push('organization_phone');
+    if (invalidPhones.length > 0) {
+      await warrantyRepository.updateEasyGasSyncResult(connection, formId, {
+        result: 'FAILED',
+        claimUrl: null,
+        error: `invalid_phone:${invalidPhones.join(',')} — expected +998XXXXXXXXX, request not sent to EasyGas`,
+      });
+      return;
+    }
+
+    // The payload carries the canonicalized values (the exact strings just
+    // validated) — the stored row itself is untouched.
+    const normalizedForm = { ...form, owner_phone: ownerPhone, organization_phone: organizationPhone };
+    const rawBody = JSON.stringify(buildPayload(normalizedForm, withEquipment.equipment, carExternalId)); // serialized exactly once
 
     const result = await easyGasWarrantyClient.submitWarranty(rawBody);
 

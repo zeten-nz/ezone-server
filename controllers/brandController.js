@@ -3,14 +3,14 @@ const { validationResult } = require('express-validator');
 const brandRepository = require('../repositories/brandRepository');
 
 const getAllBrands = async (req, res, next) => {
+  let connection;
   try {
     const page   = Math.max(1, parseInt(req.query.page, 10) || 1);
     const limit  = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
     const search = (req.query.search || '').trim();
 
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
     const { rows, total } = await brandRepository.findAllPaginated(connection, { page, limit, search });
-    connection.release();
 
     const totalPages = Math.ceil(total / limit);
     res.json({
@@ -23,40 +23,47 @@ const getAllBrands = async (req, res, next) => {
     });
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 
 /** Active brands only — powers the Product form's Brand select. Any
  * authenticated role, same as productController.searchProducts. */
 const getActiveBrands = async (req, res, next) => {
+  let connection;
   try {
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
     const brands = await brandRepository.findAllActive(connection);
-    connection.release();
     res.json(brands);
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 
 const createBrand = async (req, res, next) => {
+  let connection;
   try {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
       return res.status(400).json({ success: false, message: errors.array()[0].msg, errorCode: 'VALIDATION_ERROR', timestamp: new Date().toISOString() });
     }
 
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
     await brandRepository.create(connection, req.body);
-    connection.release();
 
     res.status(201).json({ message: 'Brand created successfully' });
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 
 const updateBrand = async (req, res, next) => {
+  let connection;
   try {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
@@ -64,13 +71,14 @@ const updateBrand = async (req, res, next) => {
     }
 
     const { brandId } = req.params;
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
     await brandRepository.update(connection, brandId, req.body);
-    connection.release();
 
     res.json({ message: 'Brand updated successfully' });
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 
@@ -79,15 +87,17 @@ const updateBrand = async (req, res, next) => {
  * history (see deleteBrand below for the one real removal path), same
  * convention as productController.setProductActive. */
 const setBrandActive = (isActive) => async (req, res, next) => {
+  let connection;
   try {
     const { brandId } = req.params;
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
     await brandRepository.setActive(connection, brandId, isActive);
-    connection.release();
 
     res.json({ message: isActive ? 'Brand activated successfully' : 'Brand deactivated successfully' });
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 

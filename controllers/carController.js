@@ -3,14 +3,14 @@ const { validationResult } = require('express-validator');
 const carRepository = require('../repositories/carRepository');
 
 const getAllCars = async (req, res, next) => {
+  let connection;
   try {
     const page   = Math.max(1, parseInt(req.query.page, 10) || 1);
     const limit  = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
     const search = (req.query.search || '').trim();
 
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
     const { rows, total } = await carRepository.findAllPaginated(connection, { page, limit, search });
-    connection.release();
 
     const totalPages = Math.ceil(total / limit);
     res.json({
@@ -23,6 +23,8 @@ const getAllCars = async (req, res, next) => {
     });
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 
@@ -32,38 +34,43 @@ const getAllCars = async (req, res, next) => {
  * productController.searchProducts — installers search mid-form-fill.
  */
 const searchCars = async (req, res, next) => {
+  let connection;
   try {
     const query = (req.query.q || '').trim();
     if (!query) {
       return res.json([]);
     }
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
     const results = await carRepository.search(connection, { query, limit: 20 });
-    connection.release();
     res.json(results);
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 
 const createCar = async (req, res, next) => {
+  let connection;
   try {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
       return res.status(400).json({ success: false, message: errors.array()[0].msg, errorCode: 'VALIDATION_ERROR', timestamp: new Date().toISOString() });
     }
 
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
     await carRepository.create(connection, req.body);
-    connection.release();
 
     res.status(201).json({ message: 'Car created successfully' });
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 
 const updateCar = async (req, res, next) => {
+  let connection;
   try {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
@@ -71,13 +78,14 @@ const updateCar = async (req, res, next) => {
     }
 
     const { carId } = req.params;
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
     await carRepository.update(connection, carId, req.body);
-    connection.release();
 
     res.json({ message: 'Car updated successfully' });
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 
@@ -85,15 +93,17 @@ const updateCar = async (req, res, next) => {
  * in the Vehicle Name autocomplete; never force-removed from history (see
  * deleteCar below for the one real removal path). */
 const setCarActive = (isActive) => async (req, res, next) => {
+  let connection;
   try {
     const { carId } = req.params;
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
     await carRepository.setActive(connection, carId, isActive);
-    connection.release();
 
     res.json({ message: isActive ? 'Car activated successfully' : 'Car deactivated successfully' });
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 

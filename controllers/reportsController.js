@@ -32,11 +32,12 @@ const getDateRangeFilter = (days) => {
  * silently dropping them (effectively turning this into an INNER JOIN).
  */
 const getTopInstallers = async (req, res, next) => {
+  let connection;
   try {
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 10));
     const dateFilter = getDateRangeFilter(req.query.period);
 
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
 
     const params = [];
     let dateCondition = '';
@@ -59,21 +60,23 @@ const getTopInstallers = async (req, res, next) => {
       params
     );
 
-    connection.release();
     res.json(rows);
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 
 /** Warranty-count series only — see getTopInstallers for why there's no
  * points column yet. */
 const getMonthlyActivity = async (req, res, next) => {
+  let connection;
   try {
     const year = parseInt(req.query.year, 10) || new Date().getFullYear();
     const { employeeId } = req.query;
 
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
 
     const conditions = ['YEAR(wf.installation_date) = ?'];
     const params = [year];
@@ -91,8 +94,6 @@ const getMonthlyActivity = async (req, res, next) => {
       params
     );
 
-    connection.release();
-
     // Fill in every month so the frontend gets a continuous 12-point series
     // (MySQL only returns rows that have data).
     const byMonth = new Map(rows.map((r) => [r.month, r]));
@@ -108,6 +109,8 @@ const getMonthlyActivity = async (req, res, next) => {
     res.json({ year, months });
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 
@@ -121,9 +124,10 @@ const getMonthlyActivity = async (req, res, next) => {
  * intended to. AUTO (the ordinary barcode path) and APPROVED (an
  * admin-confirmed Manual Verification claim) both still count normally. */
 const getProductsInstalled = async (req, res, next) => {
+  let connection;
   try {
     const { category } = req.query;
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
 
     const conditions = [`we.verification_status NOT IN ('PENDING', 'REJECTED')`];
     const params = [];
@@ -142,17 +146,19 @@ const getProductsInstalled = async (req, res, next) => {
       params
     );
 
-    connection.release();
     res.json(rows);
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 
 const getBranchRanking = async (req, res, next) => {
+  let connection;
   try {
     const dateFilter = getDateRangeFilter(req.query.period);
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
 
     const params = [];
     let dateCondition = '';
@@ -172,10 +178,11 @@ const getBranchRanking = async (req, res, next) => {
       params
     );
 
-    connection.release();
     res.json(rows);
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 
@@ -216,18 +223,19 @@ const getDashboardTotalsData = async (connection) => {
 };
 
 const getDashboardTotals = async (req, res, next) => {
+  let connection;
   try {
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
     try {
       const data = await getDashboardTotalsData(connection);
-      connection.release();
       res.json(data);
     } catch (error) {
-      connection.release();
       throw error;
     }
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 
@@ -237,6 +245,7 @@ const getDashboardTotals = async (req, res, next) => {
  * calendar month; anything else (or omitted) is lifetime.
  */
 const getPointsLeaderboard = async (req, res, next) => {
+  let connection;
   try {
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 10));
     let since = null;
@@ -245,44 +254,50 @@ const getPointsLeaderboard = async (req, res, next) => {
       since = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().split('T')[0];
     }
 
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
     const rows = await pointTransactionRepository.getLeaderboard(connection, { limit, since });
-    connection.release();
     res.json(rows);
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 
 /** Top branches ("warehouses") by current inventory stock — a different
  * ranking from getBranchRanking (which ranks by warranty count). */
 const getTopWarehouses = async (req, res, next) => {
+  let connection;
   try {
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
     const rows = await inventoryRepository.getBranchStockBreakdown(connection);
-    connection.release();
     res.json(rows.filter((r) => r.branch_id != null).slice(0, 10));
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 
 const getRecentImports = async (req, res, next) => {
+  let connection;
   try {
     const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 10));
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
     const { rows } = await inventoryImportBatchRepository.findAllPaginated(connection, { page: 1, limit });
-    connection.release();
     res.json(rows);
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 
 const getRecentWarrantyActivity = async (req, res, next) => {
+  let connection;
   try {
     const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 10));
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
     const [rows] = await connection.execute(
       `SELECT wf.id, wf.owner_full_name, wf.vehicle_name, wf.installation_date,
               wf.created_at, u.full_name AS employee_name
@@ -291,22 +306,25 @@ const getRecentWarrantyActivity = async (req, res, next) => {
        ORDER BY wf.created_at DESC, wf.id DESC
        LIMIT ${limit}`
     );
-    connection.release();
     res.json(rows);
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 
 const getRecentInventoryActivity = async (req, res, next) => {
+  let connection;
   try {
     const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 10));
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
     const rows = await inventoryRepository.getRecentActivity(connection, { limit });
-    connection.release();
     res.json(rows);
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 
@@ -378,34 +396,38 @@ const getInstallerStatisticsData = async (connection, installerId) => {
 };
 
 const getInstallerStatistics = async (req, res, next) => {
+  let connection;
   try {
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
     const data = await getInstallerStatisticsData(connection, req.params.installerId);
-    connection.release();
     res.json(data);
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 
 // Always the authenticated user's own id — never accept an installerId from
 // query params, same "/mine"-shaped pattern as GET /points/mine.
 const getMyStatistics = async (req, res, next) => {
+  let connection;
   try {
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
     const data = await getInstallerStatisticsData(connection, req.user.id);
-    connection.release();
     res.json(data);
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 
 const getProductStatistics = async (req, res, next) => {
+  let connection;
   try {
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
     const { counts, topInstallers, topBranches } = await inventoryRepository.getProductStatistics(connection, req.params.productId);
-    connection.release();
 
     const imported = Number(counts.imported) || 0;
     const damaged = Number(counts.damaged) || 0;
@@ -422,6 +444,8 @@ const getProductStatistics = async (req, res, next) => {
     });
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 
@@ -484,18 +508,17 @@ const getAllProductsStatisticsData = async (connection) => {
 };
 
 const getWarehouseStatistics = async (req, res, next) => {
+  let connection;
   try {
     const { branchId } = req.params;
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
     const [[branch]] = await connection.execute('SELECT id FROM branches WHERE id = ?', [branchId]);
     if (!branch) {
-      connection.release();
       throw new AppError('Warehouse not found', 404, 'NOT_FOUND');
     }
 
     const breakdown = await inventoryRepository.getBranchStockBreakdown(connection, { branchId });
     const movementHistory = await inventoryRepository.getRecentActivity(connection, { limit: 20, branchId });
-    connection.release();
 
     // A real branch legitimately having zero inventory assigned to it yet
     // is a normal state, not a "not found" — only the branch's own
@@ -517,6 +540,8 @@ const getWarehouseStatistics = async (req, res, next) => {
       return sendAppError(res, error);
     }
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 

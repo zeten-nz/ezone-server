@@ -12,6 +12,7 @@ const { verifyImageMagicBytes, PROFILE_UPLOAD_DIR } = require('../config/uploads
 // registrationRequestController.approveRegistrationRequest) before a real
 // users row — and therefore any access at all — is created.
 const register = async (req, res, next) => {
+  let connection;
   try {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
@@ -29,11 +30,10 @@ const register = async (req, res, next) => {
     }
 
     const { first_name, last_name, region, district, branch_id, phone, username, password } = req.body;
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
 
     const [branches] = await connection.execute('SELECT code FROM branches WHERE id = ? AND is_active = TRUE', [branch_id]);
     if (branches.length === 0) {
-      connection.release();
       fs.unlink(req.file.path, () => {});
       return res.status(400).json({ success: false, message: 'Invalid branch', errorCode: 'VALIDATION_ERROR', timestamp: new Date().toISOString() });
     }
@@ -43,7 +43,6 @@ const register = async (req, res, next) => {
       [username.trim()]
     );
     if (existingUsers.length > 0) {
-      connection.release();
       fs.unlink(req.file.path, () => {});
       return res.status(409).json({ success: false, message: 'Username is already taken', errorCode: 'CONFLICT', timestamp: new Date().toISOString() });
     }
@@ -56,7 +55,6 @@ const register = async (req, res, next) => {
       [username.trim()]
     );
     if (existingRequests.length > 0) {
-      connection.release();
       fs.unlink(req.file.path, () => {});
       return res.status(409).json({ success: false, message: 'A registration request for this username is already pending', errorCode: 'CONFLICT', timestamp: new Date().toISOString() });
     }
@@ -76,8 +74,6 @@ const register = async (req, res, next) => {
       ]
     );
 
-    connection.release();
-
     res.status(201).json({
       message: 'Registration request submitted successfully',
       status: 'PENDING',
@@ -85,10 +81,13 @@ const register = async (req, res, next) => {
   } catch (error) {
     if (req.file) fs.unlink(req.file.path, () => {});
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 
 const login = async (req, res, next) => {
+  let connection;
   try {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
@@ -96,7 +95,7 @@ const login = async (req, res, next) => {
     }
 
     const { username, password } = req.body;
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
 
     const [activeUsers] = await connection.execute(
       'SELECT * FROM users WHERE username = ? AND is_active = TRUE',
@@ -108,7 +107,6 @@ const login = async (req, res, next) => {
       const passwordMatch = await bcrypt.compare(password, user.password);
 
       if (!passwordMatch) {
-        connection.release();
         return res.status(401).json({ success: false, message: 'Invalid username or password', errorCode: 'INVALID_CREDENTIALS', timestamp: new Date().toISOString() });
       }
 
@@ -119,8 +117,6 @@ const login = async (req, res, next) => {
       );
 
       await connection.execute('UPDATE users SET last_login_at = NOW() WHERE id = ?', [user.id]);
-
-      connection.release();
 
       return res.json({
         message: 'Login successful',
@@ -163,7 +159,6 @@ const login = async (req, res, next) => {
         const passwordMatch = await bcrypt.compare(password, request.password_hash);
 
         if (passwordMatch) {
-          connection.release();
           if (request.status === 'PENDING') {
             return res.status(403).json({ success: false, message: 'Your registration request is pending approval', errorCode: 'ACCOUNT_PENDING_APPROVAL', timestamp: new Date().toISOString() });
           }
@@ -176,14 +171,16 @@ const login = async (req, res, next) => {
       }
     }
 
-    connection.release();
     return res.status(401).json({ success: false, message: 'Invalid username or password', errorCode: 'INVALID_CREDENTIALS', timestamp: new Date().toISOString() });
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 
 const changePassword = async (req, res, next) => {
+  let connection;
   try {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
@@ -193,20 +190,18 @@ const changePassword = async (req, res, next) => {
     const { currentPassword, newPassword } = req.body;
     const userId = req.user.id;
 
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
     const [users] = await connection.execute(
       'SELECT password FROM users WHERE id = ?',
       [userId]
     );
 
     if (users.length === 0) {
-      connection.release();
       return res.status(404).json({ success: false, message: 'User not found', errorCode: 'NOT_FOUND', timestamp: new Date().toISOString() });
     }
 
     const passwordMatch = await bcrypt.compare(currentPassword, users[0].password);
     if (!passwordMatch) {
-      connection.release();
       return res.status(401).json({ success: false, message: 'Current password is incorrect', errorCode: 'INVALID_CURRENT_PASSWORD', timestamp: new Date().toISOString() });
     }
 
@@ -216,18 +211,19 @@ const changePassword = async (req, res, next) => {
       [hashedPassword, userId]
     );
 
-    connection.release();
-
     res.json({ message: 'Password changed successfully' });
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 
 const getProfile = async (req, res, next) => {
+  let connection;
   try {
     const userId = req.user.id;
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
 
     // Branch region/city/district/phone (not just name) are included because
     // the warranty form's read-only summary shows exactly what will be
@@ -242,8 +238,6 @@ const getProfile = async (req, res, next) => {
       [userId]
     );
 
-    connection.release();
-
     if (users.length === 0) {
       return res.status(404).json({ success: false, message: 'User not found', errorCode: 'NOT_FOUND', timestamp: new Date().toISOString() });
     }
@@ -255,6 +249,8 @@ const getProfile = async (req, res, next) => {
     res.json({ ...profile, has_photo: !!photo_filename });
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 
@@ -265,13 +261,13 @@ const getProfile = async (req, res, next) => {
  * authenticated-stream-not-express.static approach.
  */
 const streamProfilePhoto = async (req, res, next) => {
+  let connection;
   try {
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
     const [users] = await connection.execute(
       'SELECT photo_filename FROM users WHERE id = ?',
       [req.user.id]
     );
-    connection.release();
 
     const photoFilename = users[0]?.photo_filename;
     if (!photoFilename) {
@@ -314,11 +310,18 @@ const streamProfilePhoto = async (req, res, next) => {
     stream.pipe(res);
   } catch (error) {
     next(error);
+  } finally {
+    // The connection was only needed for the SELECT — by the time streaming
+    // proceeds this has already been returned to the pool (this async
+    // function exits right after pipe() is wired up; pipe itself never
+    // touches the DB).
+    if (connection) connection.release();
   }
 };
 
 /** Replaces the caller's own profile photo, deleting the previous file (if any). */
 const updateProfilePhoto = async (req, res, next) => {
+  let connection;
   try {
     if (!req.file) {
       return res.status(400).json({ success: false, message: 'Photo is required', errorCode: 'VALIDATION_ERROR', timestamp: new Date().toISOString() });
@@ -329,12 +332,11 @@ const updateProfilePhoto = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'File is not a valid image', errorCode: 'INVALID_FILE_TYPE', timestamp: new Date().toISOString() });
     }
 
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
     const [users] = await connection.execute('SELECT photo_filename FROM users WHERE id = ?', [req.user.id]);
     const previousFilename = users[0]?.photo_filename;
 
     await connection.execute('UPDATE users SET photo_filename = ? WHERE id = ?', [req.file.filename, req.user.id]);
-    connection.release();
 
     if (previousFilename) {
       fs.unlink(path.join(PROFILE_UPLOAD_DIR, path.basename(previousFilename)), () => {});
@@ -344,18 +346,20 @@ const updateProfilePhoto = async (req, res, next) => {
   } catch (error) {
     if (req.file) fs.unlink(req.file.path, () => {});
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 
 /** Removes the caller's own profile photo — no error if there wasn't one. */
 const removeProfilePhoto = async (req, res, next) => {
+  let connection;
   try {
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
     const [users] = await connection.execute('SELECT photo_filename FROM users WHERE id = ?', [req.user.id]);
     const previousFilename = users[0]?.photo_filename;
 
     await connection.execute('UPDATE users SET photo_filename = NULL WHERE id = ?', [req.user.id]);
-    connection.release();
 
     if (previousFilename) {
       fs.unlink(path.join(PROFILE_UPLOAD_DIR, path.basename(previousFilename)), () => {});
@@ -364,6 +368,8 @@ const removeProfilePhoto = async (req, res, next) => {
     res.json({ message: 'Profile photo removed successfully' });
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 

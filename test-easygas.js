@@ -12,15 +12,24 @@
  * server, and only after two local, offline self-checks both pass.
  *
  * Usage:
- *   node test-easygas.js
+ *   node test-easygas.js          — SAFE default: offline checks only
+ *                                    (config, secret fingerprint, HMAC test
+ *                                    vectors, payload build + signing
+ *                                    diagnostics). Sends NOTHING.
+ *   node test-easygas.js --send   — explicit opt-in: additionally performs
+ *                                    the one real POST to EasyGas.
  *
  * Requires EASYGAS_WARRANTY_API_BASE_URL and EASYGAS_SHARED_SECRET — set
  * in ezone-server/.env (auto-loaded below) or exported in your shell.
- * Neither is hardcoded here.
+ * Neither is hardcoded here, and the secret is never printed (only a
+ * one-way SHA256 fingerprint).
  */
 
 require('dotenv').config();
 const crypto = require('crypto');
+
+// Live network POST requires this explicit flag — see the gate in main().
+const LIVE_SEND = process.argv.includes('--send');
 
 const BASE_URL = process.env.EASYGAS_WARRANTY_API_BASE_URL;
 const SHARED_SECRET = process.env.EASYGAS_SHARED_SECRET;
@@ -231,6 +240,21 @@ async function main() {
   console.log('Method: POST');
   console.log('Headers:', JSON.stringify(headers, null, 2));
   console.log('Body:', rawBody);
+
+  // SAFE BY DEFAULT: everything above is offline (config check, secret
+  // fingerprint, HMAC vectors, payload construction, signing diagnostics).
+  // The actual network POST below only fires with an explicit --send flag —
+  // a casual `node test-easygas.js` on a machine with real credentials
+  // configured must never submit a real warranty to EasyGas by accident.
+  if (!LIVE_SEND) {
+    printSection('DRY RUN — NO REQUEST SENT');
+    console.log('All offline checks completed. Nothing was transmitted to EasyGas.');
+    console.log('To actually send the request above, re-run with the explicit flag:');
+    console.log('\n  node test-easygas.js --send\n');
+    return;
+  }
+
+  printSection('!!! LIVE REQUEST — SENDING TO EASYGAS NOW !!!');
 
   let response;
   try {

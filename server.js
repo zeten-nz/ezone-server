@@ -257,9 +257,10 @@ app.get('/api/export/employee', verifyToken, exportEmployeeData);
 // existing tables — nothing existing above was renamed, removed, or
 // restructured, so no existing consumer of this endpoint breaks.
 app.get('/api/dashboard', verifyToken, authorizeRole('ADMIN'), async (req, res, next) => {
+  let connection;
   try {
     const { pool } = require('./config/database');
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
 
     const [employeeCount] = await connection.execute(
       'SELECT COUNT(*) as count FROM users WHERE role = ? AND is_active = ?',
@@ -310,8 +311,6 @@ app.get('/api/dashboard', verifyToken, authorizeRole('ADMIN'), async (req, res, 
        LIMIT 5`
     );
 
-    connection.release();
-
     // Fill in the full 14-day window with zero-count days so the frontend
     // gets a continuous series (MySQL only returns rows that have data).
     const countsByDate = new Map(
@@ -337,6 +336,13 @@ app.get('/api/dashboard', verifyToken, authorizeRole('ADMIN'), async (req, res, 
     });
   } catch (error) {
     next(error); // Forward to centralized errorHandler
+  } finally {
+    // Release in finally, not inline after the queries — a query failure
+    // above would otherwise leak this connection permanently (the pool
+    // counts it as in-use forever; DB_POOL_SIZE of these and every request
+    // hangs on getConnection). Same guarantee productController's mutating
+    // handlers already use.
+    if (connection) connection.release();
   }
 });
 

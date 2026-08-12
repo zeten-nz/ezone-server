@@ -94,6 +94,7 @@ const validateBarcode = async (req, res, next) => {
 };
 
 const getInventory = async (req, res, next) => {
+  let connection;
   try {
     const page = Math.max(1, parseInt(req.query.page, 10) || 1);
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
@@ -103,12 +104,11 @@ const getInventory = async (req, res, next) => {
       installedFrom, installedTo, claimedFrom, claimedTo,
     } = req.query;
 
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
     const { rows, total } = await inventoryRepository.findAllPaginated(connection, {
       page, limit, productId, status, search,
       installerId, branchId, importBatchId, installedFrom, installedTo, claimedFrom, claimedTo,
     });
-    connection.release();
 
     const totalPages = Math.ceil(total / limit);
     res.json({
@@ -117,17 +117,19 @@ const getInventory = async (req, res, next) => {
     });
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 
 const getImportBatches = async (req, res, next) => {
+  let connection;
   try {
     const page = Math.max(1, parseInt(req.query.page, 10) || 1);
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
 
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
     const { rows, total } = await inventoryImportBatchRepository.findAllPaginated(connection, { page, limit });
-    connection.release();
 
     const totalPages = Math.ceil(total / limit);
     res.json({
@@ -136,15 +138,17 @@ const getImportBatches = async (req, res, next) => {
     });
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 
 const getImportBatchDetail = async (req, res, next) => {
+  let connection;
   try {
     const { batchId } = req.params;
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
     const batch = await inventoryImportBatchRepository.findById(connection, batchId);
-    connection.release();
 
     if (!batch) {
       return res.status(404).json({ success: false, message: 'Import batch not found', errorCode: 'NOT_FOUND', timestamp: new Date().toISOString() });
@@ -152,6 +156,8 @@ const getImportBatchDetail = async (req, res, next) => {
     res.json(batch);
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 

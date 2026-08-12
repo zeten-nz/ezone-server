@@ -81,8 +81,6 @@ const exportWarrantyForms = async (req, res, next) => {
     const lang = getLang(req);
     const dateFilter = getDateRangeFilter(days);
 
-    const connection = await pool.getConnection();
-
     let query = `SELECT wf.*, u.full_name as employee_name, u.branch_code
        FROM warranty_forms wf
        JOIN users u ON wf.employee_id = u.id`;
@@ -96,9 +94,18 @@ const exportWarrantyForms = async (req, res, next) => {
 
     query += ` ORDER BY wf.created_at DESC`;
 
-    const [rawForms] = await connection.execute(query, params);
-    const forms = await attachEquipment(connection, rawForms);
-    connection.release();
+    // Inner try/finally so a query failure can't leak the connection, while
+    // keeping the original release timing — returned to the pool BEFORE the
+    // (potentially slow) workbook build/stream below, which never touches
+    // the DB. Errors still reach the outer catch unchanged.
+    let forms;
+    const connection = await pool.getConnection();
+    try {
+      const [rawForms] = await connection.execute(query, params);
+      forms = await attachEquipment(connection, rawForms);
+    } finally {
+      connection.release();
+    }
 
     const workbook = new ExcelJS.Workbook();
     const worksheet = workbook.addWorksheet(lang === 'ru' ? 'Гарантийные формы' : 'Kafolat daftarlari');
@@ -167,8 +174,6 @@ const exportByBranch = async (req, res, next) => {
     const lang = getLang(req);
     const dateFilter = getDateRangeFilter(days);
 
-    const connection = await pool.getConnection();
-
     let query = `SELECT wf.*, u.full_name as employee_name, u.branch_code
        FROM warranty_forms wf
        JOIN users u ON wf.employee_id = u.id
@@ -183,9 +188,15 @@ const exportByBranch = async (req, res, next) => {
 
     query += ` ORDER BY wf.created_at DESC`;
 
-    const [rawForms] = await connection.execute(query, params);
-    const forms = await attachEquipment(connection, rawForms);
-    connection.release();
+    // Same leak-proof inner try/finally as exportWarrantyForms above.
+    let forms;
+    const connection = await pool.getConnection();
+    try {
+      const [rawForms] = await connection.execute(query, params);
+      forms = await attachEquipment(connection, rawForms);
+    } finally {
+      connection.release();
+    }
 
     const workbook = new ExcelJS.Workbook();
     const worksheet = workbook.addWorksheet(branch.substring(0, 31));
@@ -257,35 +268,43 @@ const exportEmployeeData = async (req, res, next) => {
     const lang = getLang(req);
     const dateFilter = getDateRangeFilter(days);
 
+    // Same leak-proof inner try/finally as exportWarrantyForms above — the
+    // employee-not-found early return moves after the release (it needs
+    // empData, not the connection), preserving its exact 404 response.
+    let empData;
+    let forms;
     const connection = await pool.getConnection();
+    try {
+      [empData] = await connection.execute(
+        'SELECT full_name, username, branch_code FROM users WHERE id = ?',
+        [employeeId]
+      );
 
-    const [empData] = await connection.execute(
-      'SELECT full_name, username, branch_code FROM users WHERE id = ?',
-      [employeeId]
-    );
+      if (empData.length > 0) {
+        let query = `SELECT wf.*, u.full_name as employee_name
+           FROM warranty_forms wf
+           JOIN users u ON wf.employee_id = u.id
+           WHERE wf.employee_id = ?`;
+
+        const params = [employeeId];
+
+        if (dateFilter) {
+          query += ` AND DATE(wf.created_at) >= ?`;
+          params.push(dateFilter);
+        }
+
+        query += ` ORDER BY wf.created_at DESC`;
+
+        const [rawForms] = await connection.execute(query, params);
+        forms = await attachEquipment(connection, rawForms);
+      }
+    } finally {
+      connection.release();
+    }
 
     if (empData.length === 0) {
-      connection.release();
       return res.status(404).json({ success: false, message: 'Employee not found', errorCode: 'NOT_FOUND', timestamp: new Date().toISOString() });
     }
-
-    let query = `SELECT wf.*, u.full_name as employee_name
-       FROM warranty_forms wf
-       JOIN users u ON wf.employee_id = u.id
-       WHERE wf.employee_id = ?`;
-
-    const params = [employeeId];
-
-    if (dateFilter) {
-      query += ` AND DATE(wf.created_at) >= ?`;
-      params.push(dateFilter);
-    }
-
-    query += ` ORDER BY wf.created_at DESC`;
-
-    const [rawForms] = await connection.execute(query, params);
-    const forms = await attachEquipment(connection, rawForms);
-    connection.release();
 
     const workbook = new ExcelJS.Workbook();
     const worksheet = workbook.addWorksheet(empData[0].full_name.substring(0, 31));

@@ -4,15 +4,15 @@ const productService = require('../services/productService');
 const { EQUIPMENT_TYPE_TO_CATEGORIES } = require('../config/equipmentCategories');
 
 const getAllProducts = async (req, res, next) => {
+  let connection;
   try {
     const page     = Math.max(1, parseInt(req.query.page, 10) || 1);
     const limit    = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
     const search   = (req.query.search || '').trim();
     const category = (req.query.category || '').trim();
 
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
     const { rows, total } = await productService.findAllPaginated(connection, { page, limit, search, category });
-    connection.release();
 
     const totalPages = Math.ceil(total / limit);
     res.json({
@@ -25,6 +25,8 @@ const getAllProducts = async (req, res, next) => {
     });
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 
@@ -40,6 +42,7 @@ const getAllProducts = async (req, res, next) => {
  * installation-wide fuel type.
  */
 const searchProducts = async (req, res, next) => {
+  let connection;
   try {
     const query = (req.query.q || '').trim();
     const equipmentType = (req.query.equipmentType || '').trim();
@@ -47,13 +50,14 @@ const searchProducts = async (req, res, next) => {
     const fuelType = (req.query.fuelType || '').trim();
     const categories = EQUIPMENT_TYPE_TO_CATEGORIES[equipmentType] || null;
 
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
     const results = await productService.search(connection, { query, categories, brand: brand || null, fuelType: fuelType || null, limit: 20 });
-    connection.release();
 
     res.json(results);
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 
@@ -63,17 +67,19 @@ const searchProducts = async (req, res, next) => {
  * access as searchProducts.
  */
 const getBrands = async (req, res, next) => {
+  let connection;
   try {
     const equipmentType = (req.query.equipmentType || '').trim();
     const categories = EQUIPMENT_TYPE_TO_CATEGORIES[equipmentType] || null;
 
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
     const brands = await productService.getDistinctBrands(connection, categories);
-    connection.release();
 
     res.json(brands);
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 
@@ -132,15 +138,17 @@ const updateProduct = async (req, res, next) => {
  * history (see deleteProduct below for the one real removal path).
  */
 const setProductActive = (isActive) => async (req, res, next) => {
+  let connection;
   try {
     const { productId } = req.params;
-    const connection = await pool.getConnection();
+    connection = await pool.getConnection();
     await productService.setActive(connection, productId, isActive);
-    connection.release();
 
     res.json({ message: isActive ? 'Product activated successfully' : 'Product deactivated successfully' });
   } catch (error) {
     next(error);
+  } finally {
+    if (connection) connection.release();
   }
 };
 
