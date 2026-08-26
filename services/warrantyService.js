@@ -509,10 +509,21 @@ const deleteWarrantyForm = async (connection, formId, actingUserId) => {
   }
 };
 
+/**
+ * Auto-submit a newly-created warranty to EasyGas (admin approval no longer exists for new warranties). Called by the
+ * controller AFTER createWarrantyForm has committed AND its create connection has been released — never during the
+ * create transaction (no DB lock/transaction is held during the external HTTP call). Delegates to the exact same
+ * fire-and-forget sync the (now historical-only) admin-approval path uses: syncWarrantyForm records SUCCESS/FAILED +
+ * claim_url on the row and NEVER rolls back the committed warranty. The caller invokes this ONLY when a warranty was
+ * actually created (created === true), so an idempotent submission_uuid retry never triggers a second EasyGas POST.
+ */
+const submitWarrantyToEasyGas = (formId) => easyGasWarrantySyncService.syncWarrantyForm(pool, formId);
+
 module.exports = {
   getEmployeeSnapshot,
   resolveEquipment,
   createWarrantyForm,
+  submitWarrantyToEasyGas,
   updateWarrantyForm,
   reviewManualVerification,
   reviewWarrantyForm,

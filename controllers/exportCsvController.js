@@ -24,6 +24,8 @@ const inventoryRepository = require('../repositories/inventoryRepository');
 const warrantyRepository = require('../repositories/warrantyRepository');
 const pointTransactionRepository = require('../repositories/pointTransactionRepository');
 const reportsController = require('./reportsController');
+const { attachEquipment } = require('../utils/warrantyEquipment');
+const { buildWarrantyColumns } = require('../utils/warrantyCsvColumns');
 
 const dateStamp = () => new Date().toISOString().split('T')[0];
 
@@ -71,20 +73,16 @@ const exportWarranty = async (req, res, next) => {
     connection = await pool.getConnection();
     await streamRowsAsCsv(res, {
       filename: `warranty_${dateStamp()}.csv`,
-      columns: [
-        { header: labels.columns.id, value: (r) => r.id },
-        { header: labels.columns.employee, value: (r) => r.employee_name },
-        { header: labels.columns.ownerName, value: (r) => r.owner_full_name },
-        { header: labels.columns.ownerPhone, value: (r) => r.owner_phone },
-        { header: labels.columns.vehicle, value: (r) => r.vehicle_name },
-        { header: labels.columns.plateNumber, value: (r) => r.vehicle_plate_number },
-        { header: labels.columns.vin, value: (r) => r.vehicle_vin },
-        { header: labels.columns.fuelType, value: (r) => translateEnum(labels.fuelTypes, r.fuel_type) },
-        { header: labels.columns.installationDate, value: (r) => formatCsvDate(r.installation_date, language, false) },
-        { header: labels.columns.warrantyBookNumber, value: (r) => r.warranty_book_number },
-        { header: labels.columns.createdAt, value: (r) => formatCsvDate(r.created_at, language, true) },
-      ],
-      fetchChunk: (lastId, limit) => warrantyRepository.findChunkForExport(connection, { lastId, limit, employeeId, search, verificationStatus }),
+      // Full detail-view parity, incl. separate per-equipment product+serial columns (§9). Column set + per-slot
+      // resolution live in utils/warrantyCsvColumns.js (unit-tested).
+      columns: buildWarrantyColumns(labels, language),
+      // Keyset pagination preserved: fetch one warranty chunk, then enrich it with ONE batched warranty_equipment
+      // query (attachEquipment → equipmentRepository.findByWarrantyFormIds) — no N+1, memory stays O(chunk). Rows
+      // still carry wf.id, so streamRowsAsCsv's keyset cursor is unaffected.
+      fetchChunk: async (lastId, limit) => {
+        const rows = await warrantyRepository.findChunkForExport(connection, { lastId, limit, employeeId, search, verificationStatus });
+        return attachEquipment(connection, rows);
+      },
     });
   } catch (error) {
     if (!res.headersSent) return next(error);

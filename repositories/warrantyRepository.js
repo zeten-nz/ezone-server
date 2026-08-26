@@ -60,13 +60,16 @@ const getNextWarrantyNumber = async (connection, year) => {
 
 const insert = async (connection, employeeId, snapshot, data, warrantyBookNumber) => {
   const [result] = await connection.execute(
+    // status is created SUCCESSFUL (literal): admin approval is no longer a stage — a new warranty is final on
+    // creation and is submitted to EasyGas immediately afterward. The separate easygas_sync_result column tracks the
+    // REMOTE outcome (never conflated with this local status). Historical PENDING rows are untouched.
     `INSERT INTO warranty_forms (
        employee_id, installer_region, city, installer_district, installer_branch, organization_phone,
        installer_full_name, installer_phone, installer_branch_code,
        submission_uuid, warranty_book_number, installation_date, fuel_type,
        vehicle_name, car_id, vehicle_production_year, vehicle_plate_number, vehicle_vin, vehicle_mileage,
-       owner_full_name, owner_phone
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       owner_full_name, owner_phone, status
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'SUCCESSFUL')`,
     [
       employeeId, snapshot.region, snapshot.city || null, snapshot.district, snapshot.branch_name, snapshot.branch_phone || null,
       snapshot.full_name, snapshot.installer_phone || null, snapshot.branch_code,
@@ -337,8 +340,11 @@ const findChunkForExport = async (connection, { lastId, limit, employeeId, searc
     params.push(`%${search}%`, `%${search}%`, `%${search}%`);
   }
   const [rows] = await connection.execute(
-    `SELECT wf.*, u.full_name AS employee_name, u.username AS employee_username, ${FUEL_TYPE_SELECT}
+    // ru = the reviewing admin (LEFT JOIN — reviewed_by is NULL until reviewed); exposes reviewed_by_name for the
+    // CSV export's "Reviewed by" column without an N+1. Does not affect the keyset ORDER BY wf.id.
+    `SELECT wf.*, u.full_name AS employee_name, u.username AS employee_username, ru.full_name AS reviewed_by_name, ${FUEL_TYPE_SELECT}
      FROM warranty_forms wf JOIN users u ON wf.employee_id = u.id
+     LEFT JOIN users ru ON ru.id = wf.reviewed_by
      ${FUEL_TYPE_JOIN}
      WHERE ${conditions.join(' AND ')}
      ORDER BY wf.id ASC LIMIT ${Number(limit)}`,

@@ -30,6 +30,23 @@ const createWarrantyForm = async (req, res, next) => {
 
     connection = await pool.getConnection();
     const result = await warrantyService.createWarrantyForm(connection, req.user.id, req.body);
+    // Release the create connection BEFORE the external EasyGas HTTP call — the create transaction is already
+    // committed, and no DB connection/lock may be held for the duration of a network request (up to 15s).
+    connection.release();
+    connection = null;
+
+    // Auto-submit to EasyGas immediately after creation — admin approval is gone. ONLY the request that actually
+    // created the warranty submits (an idempotent submission_uuid retry returns created:false and must NOT trigger a
+    // second EasyGas POST). syncWarrantyForm records the remote outcome on the row (easygas_sync_result SUCCESS/FAILED)
+    // and never rolls back the committed warranty; wrap defensively so the create response always succeeds regardless.
+    if (result.created) {
+      try {
+        await warrantyService.submitWarrantyToEasyGas(result.formId);
+      } catch (syncError) {
+        console.error(`[Warranty] EasyGas submission error for form ${result.formId}:`, syncError.message);
+      }
+    }
+
     res.status(result.created ? 201 : 200).json({
       message: result.created ? 'Warranty form submitted successfully' : 'Warranty form already submitted',
       id: result.formId,

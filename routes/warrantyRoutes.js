@@ -133,10 +133,13 @@ router.delete('/:formId', verifyToken, authorizeRole('ADMIN'), deleteWarrantyFor
 router.post('/equipment/:equipmentId/approve-verification', verifyToken, authorizeRole('ADMIN'), manualVerificationReviewRules, approveManualVerification);
 router.post('/equipment/:equipmentId/reject-verification', verifyToken, authorizeRole('ADMIN'), manualVerificationReviewRules, rejectManualVerification);
 
-// Warranty status workflow — admin reviews the warranty form itself
-// (PENDING -> SUCCESSFUL/REJECTED). ADMIN-only, same as every other
-// review/approval action in this app. Approving triggers the EasyGas sync
-// exactly once, inside warrantyService.reviewWarrantyForm — never here.
+// Warranty status workflow — HISTORICAL-ONLY now: new warranties are
+// created status SUCCESSFUL and auto-submitted to EasyGas at creation
+// (see warrantyController.createWarrantyForm), so these review endpoints
+// only ever match warranties still sitting at the old PENDING state
+// (reviewForm's atomic WHERE status='PENDING' guard). Approving one of
+// those historical rows still triggers the EasyGas sync exactly once,
+// inside warrantyService.reviewWarrantyForm — never here. ADMIN-only.
 router.post('/:formId/approve', verifyToken, authorizeRole('ADMIN'), warrantyReviewRules, approveWarrantyForm);
 router.post('/:formId/reject', verifyToken, authorizeRole('ADMIN'), warrantyReviewRules, rejectWarrantyForm);
 

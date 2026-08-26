@@ -48,16 +48,32 @@
  * identical brands→products→cars sequencing and both record the same Last
  * Sync Time/Status/Message (sync_state, sync_key='catalog').
  *
- * Per that same decision, deletion-detection (auto-deactivating local rows
- * that vanished from a full pull) has been REMOVED from syncProducts and
- * syncCars below — EasyGas currently exposes no explicit deletion signal, so
- * a product/car simply missing from one pull is no longer treated as
- * evidence it was deleted (a paused category, a mid-pagination hiccup, or a
- * temporary EasyGas-side filter change would previously have caused a false
- * deactivation). Sync now only ever inserts new rows and updates existing
- * ones by external_id — it never flips is_active to FALSE. If EasyGas ever
- * adds a real deletion mechanism (e.g. a `deleted` flag or a tombstone
- * endpoint), that should drive is_active going forward, not absence.
+ * STALE RECONCILIATION (WARRANTY SELECTABILITY) — reinstated for PRODUCTS
+ * only, and only in a form that is safe against every partial-pull failure
+ * mode. The new rule: a local EasyGas product (external_id set) that is
+ * ABSENT from a COMPLETE, SUCCESSFUL /products walk must not remain
+ * selectable for NEW warranties — the live EasyGas warranty API rejects a
+ * product it no longer knows (real 422 PRODUCT_UNKNOWN, controller_product_id
+ * 375). So syncProducts now soft-disables such rows (is_active=FALSE) — see
+ * reconcileStaleProducts below. Crucial safety properties:
+ *   - It runs ONLY after walkPaginatedCatalog returned {ok:true}, i.e. every
+ *     page 1..last_page was fetched with HTTP 2xx. A network failure, HTTP
+ *     failure, mid-pagination failure, malformed/interrupted pull, or a lock
+ *     conflict all short-circuit BEFORE it — zero deactivations on any
+ *     non-complete pull (the false-deactivation risk that got the old
+ *     deletion-detection removed).
+ *   - "Absent" is decided from the SET of warranty-category external_ids the
+ *     pull actually returned (collected in the walk), never from a single
+ *     page or from synced_at — so a brand-skipped or transiently upsert-failed
+ *     row that IS in the catalog is never wrongly deactivated.
+ *   - An EMPTY seen set (a suspicious/empty successful pull) deactivates
+ *     NOTHING (fail-safe).
+ *   - NEVER DELETE. Historical warranty_equipment.product_id keeps resolving
+ *     the row for display/export. Reactivation is automatic: upsertProduct
+ *     forces is_active=TRUE on conflict, and a reactivated product is in the
+ *     seen set so reconciliation won't touch it.
+ * syncCars keeps NO deletion-detection (cars are not warranty-submitted, so
+ * absence there has no submit-time consequence and the old removal stands).
  *
  * LOCKING (added for the "never run twice simultaneously" requirement):
  * runFullSync claims an atomic DB-level lock (acquireSyncLock, sync_state.
@@ -317,6 +333,32 @@ const upsertProduct = async (pool, product) => {
   return { outcome: result.affectedRows === 1 ? 'inserted' : result.affectedRows === 2 ? 'updated' : 'unchanged' };
 };
 
+/**
+ * Soft-disable local EasyGas products (external_id set, currently active) whose external_id was NOT returned by a
+ * COMPLETE, successful /products pull. Caller MUST only invoke this when walkPaginatedCatalog returned {ok:true}.
+ * `seenExternalIds` is the set of warranty-category product ids the pull returned. Fail-safe: an EMPTY set
+ * deactivates nothing. NEVER DELETE (historical warranty_equipment rows keep resolving the product). Returns the
+ * number of rows deactivated. See the STALE RECONCILIATION note in this file's header.
+ */
+const reconcileStaleProducts = async (pool, seenExternalIds) => {
+  const seen = [...seenExternalIds].map((id) => String(id)).filter((id) => id.length > 0);
+  if (seen.length === 0) {
+    console.warn('[EasyGas Catalog Sync] Stale reconciliation SKIPPED — the pull returned zero warranty products; deactivating nothing (fail-safe).');
+    return 0;
+  }
+  const placeholders = seen.map(() => '?').join(',');
+  const [result] = await pool.execute(
+    `UPDATE products SET is_active = FALSE
+     WHERE external_id IS NOT NULL AND is_active = TRUE AND external_id NOT IN (${placeholders})`,
+    seen
+  );
+  const deactivated = result.affectedRows || 0;
+  if (deactivated > 0) {
+    console.warn(`[EasyGas Catalog Sync] Stale reconciliation: soft-disabled ${deactivated} product(s) absent from the current EasyGas catalog (is_active=FALSE, never deleted).`);
+  }
+  return deactivated;
+};
+
 const syncProducts = async (pool) => {
   await getSyncCheckpoint(pool, 'products'); // recorded for visibility only, not used to filter the request (see note above)
   // Read the cycle's start time FROM MySQL itself (never Node's own
@@ -330,10 +372,17 @@ const syncProducts = async (pool) => {
   const [[{ startedAt }]] = await pool.execute('SELECT NOW() AS startedAt');
   const counts = { inserted: 0, updated: 0, skipped: 0, failed: 0 };
   const unmappedCategories = new Map();
+  // Every warranty-category external_id this pull returns, for stale reconciliation once the whole walk succeeds.
+  const seenExternalIds = new Set();
   const walk = await walkPaginatedCatalog(
     (page) => easyGasCatalogClient.getProducts({ page, per_page: PAGE_SIZE }),
     async (rows) => {
       for (const product of rows) {
+        // Count a warranty-category product as "seen" INDEPENDENT of its own upsert outcome — a brand-skip or a
+        // transient per-row upsert exception below must never make a product that IS in the catalog look absent.
+        if (product && product.id != null && mapExternalCategory(product.product_category_id)) {
+          seenExternalIds.add(String(product.id));
+        }
         try {
           const result = await upsertProduct(pool, product);
           if (result.outcome === 'inserted') {
@@ -355,16 +404,18 @@ const syncProducts = async (pool) => {
       }
     }
   );
-  if (!walk.ok) return { ok: false, reason: walk.reason };
+  if (!walk.ok) return { ok: false, reason: walk.reason }; // partial/failed pull → NO reconciliation (fail-safe)
 
-  // No deletion-detection step here by design — see the ARCHITECTURE
-  // DECISION note in this file's header. A product missing from a pull is no
-  // longer treated as evidence it was deleted; sync only ever inserts/updates.
+  // The whole /products walk succeeded (every page HTTP-2xx). Only NOW is absence meaningful: soft-disable local
+  // EasyGas products no longer in the catalog so they can't be selected for NEW warranties. Fail-safe on empty. See
+  // the STALE RECONCILIATION note in this file's header. Never DELETE; reactivation is automatic via upsertProduct.
+  const deactivated = await reconcileStaleProducts(pool, seenExternalIds);
 
   await setSyncCheckpoint(pool, 'products', startedAt);
   return {
     ok: true,
     ...counts,
+    deactivated,
     unmappedCategories: [...unmappedCategories.entries()].map(([id, v]) => ({ id, name: v.name, count: v.count })),
   };
 };
@@ -568,4 +619,4 @@ const runFullSync = async (pool) => {
   }
 };
 
-module.exports = { syncBrands, syncProducts, syncCars, runFullSync, getSyncSummary };
+module.exports = { syncBrands, syncProducts, syncCars, runFullSync, getSyncSummary, reconcileStaleProducts };

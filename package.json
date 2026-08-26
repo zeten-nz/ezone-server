@@ -5,6 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
+    "test": "node --test test/**/*.test.js",
     "dev": "set NODE_ENV=development&& nodemon server.js",
     "pm2:start": "pm2 start ecosystem.config.js --env production",
     "pm2:reload": "pm2 reload ecosystem.config.js --env production",
