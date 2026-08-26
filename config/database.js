@@ -612,10 +612,14 @@ const initializeDatabase = async (loadMockData = false) => {
     // above actually becomes SUCCESSFUL (see warrantyService.reviewWarrantyForm
     // + services/easyGasWarrantySyncService.js). Deliberately new, distinctly-
     // named columns rather than reusing the DEAD easygas_sync_status/
-    // easygas_synced_at/easygas_last_error columns above: those are tracked
-    // for a future DROP COLUMN cleanup (migrations/phase2-drop-easygas-schema.js
-    // already lists them) — repurposing them for this new, unrelated feature
-    // would make that pending migration silently destroy live data.
+    // easygas_synced_at/easygas_last_error columns above (those belonged to
+    // the removed sweep-based integration and are kept untouched purely for
+    // historical rows). NOTE: the old phase2-drop-easygas-schema.js migration
+    // was DELETED (2026-08-26) — it predated the rebuilt integration and
+    // would have dropped the LIVE products/brands/cars external_id+synced_at
+    // columns and the LIVE sync_state table. If the dead warranty_forms/
+    // branches columns are ever dropped, write a fresh migration against the
+    // then-current schema; never drop external_id/synced_at/sync_state.
     await ensureColumn(connection, 'warranty_forms', 'easygas_claim_url', 'easygas_claim_url VARCHAR(500) NULL AFTER review_notes');
     await ensureColumn(connection, 'warranty_forms', 'easygas_sync_result', 'easygas_sync_result ENUM(\'PENDING\', \'SUCCESS\', \'FAILED\') NOT NULL DEFAULT \'PENDING\' AFTER easygas_claim_url');
     await ensureColumn(connection, 'warranty_forms', 'easygas_sync_completed_at', 'easygas_sync_completed_at TIMESTAMP NULL DEFAULT NULL AFTER easygas_sync_result');

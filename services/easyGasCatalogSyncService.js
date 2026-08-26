@@ -13,25 +13,27 @@
  * {base}/cars (see easyGasCatalogClient.js). These SUPERSEDE the retired
  * /public/api/{products,product-brands,cars} paths this sync used before.
  *
- * Field mapping (product_category_id, product_brand_id, station_type, name,
- * id on products; id/brand_id/brand_name/name on cars; id/name/full_name/
- * country/logo on brands) was live-confirmed against the OLD public
- * endpoints, which served the same underlying EasyGas entities (the
- * stag-db dumps this project's one-time migration imported corroborate the
- * same column set). The NEW endpoints' exact response envelopes have not
- * yet been captured in this repository, so extraction below is deliberately
- * TOLERANT (extractRows accepts both a bare JSON array and a
- * `{data: [...]}` wrapper, paginated via `meta.last_page` when present) and
- * every field mapping stays FAIL-CLOSED: a row that doesn't carry the
- * expected fields is skipped and counted, never guessed at, and sync never
- * deletes or deactivates anything — so a shape mismatch can only ever
- * under-import (visible in the skip counts / FAILED status), never corrupt
- * local data. Note /public/api/products did NOT pre-filter server-side to
- * warranty-relevant equipment — filtering to the 4 warranty categories is
- * entirely CLIENT-SIDE via config/externalCategoryMap.js's whitelist
+ * RESPONSE SHAPES — CONFIRMED via signed production probes (2026-08-26),
+ * no longer guessed:
+ *   - /brands: unpaginated `{ data: [{id, name}] }` — items carry ONLY
+ *     id+name (no full_name/country/logo on this endpoint; see upsertBrand
+ *     for how the locally-stored descriptive columns are preserved).
+ *   - /products and /cars: TOP-LEVEL Laravel paginator —
+ *     `{ current_page, data: [...], last_page, total, ... }`. `last_page`
+ *     is top-level, NOT under a `meta` wrapper (the old public endpoints'
+ *     `meta.last_page` shape is kept only as a harmless fallback).
+ *   - product item: { id, name, name_ru, product_brand_id,
+ *     product_category_id, component_type, station_type, updated_at }.
+ *   - car item: { id, name, brand_name, updated_at }.
+ * Extraction stays TOLERANT (extractRows accepts both a bare JSON array and
+ * a `{data: [...]}` wrapper) and every field mapping stays FAIL-CLOSED: a
+ * row missing required fields is skipped and counted, never guessed at, and
+ * sync never deletes or deactivates anything. The endpoint returns
+ * EasyGas's whole product line — filtering to the 4 warranty categories is
+ * entirely CLIENT-SIDE via config/externalCategoryMap.js's id whitelist
  * (mapExternalCategory returning null is what does the real filtering — see
- * upsertProduct below); the same applies to the new endpoint until proven
- * otherwise.
+ * upsertProduct below); the confirmed `component_type` field is surfaced in
+ * diagnostics only, the id whitelist remains authoritative.
  *
  * ARCHITECTURE DECISION (final, per the catalog-sync-button update): EasyGas
  * is the single source of truth for brands/products/cars, but the app never
@@ -100,10 +102,12 @@ const extractRows = (data) => {
 };
 
 /**
- * Walks every page of a signed EasyGas list endpoint. Pagination fields are
- * read tolerantly: `meta.last_page` (the Laravel wrapper the old public
- * endpoints used) or a top-level `last_page`; when neither exists (an
- * unpaginated response — a bare array or a plain `{data: [...]}`), the walk
+ * Walks every page of a signed EasyGas list endpoint. The CONFIRMED real
+ * shape (production probe, 2026-08-26) is a top-level Laravel paginator —
+ * `last_page` lives at the TOP LEVEL of the response body, so that is read
+ * first; `meta.last_page` (the old public endpoints' wrapper) is kept only
+ * as a harmless fallback. When neither exists (an unpaginated response —
+ * a bare array or a plain `{data: [...]}`, e.g. /brands), the walk
  * correctly stops after page 1, which then already contained everything.
  * Stops as soon as a page fails (network error or non-2xx) instead of
  * skipping ahead, so a mid-walk failure just means "try again next sweep
@@ -117,7 +121,7 @@ const walkPaginatedCatalog = async (fetchPage, onPage) => {
     const result = await fetchPage(page);
     if (!result.ok) return { ok: false, reason: result.networkError ? 'network' : `http_${result.status}` };
     await onPage(extractRows(result.data));
-    const lastPage = result.data?.meta?.last_page || result.data?.last_page || 1;
+    const lastPage = result.data?.last_page || result.data?.meta?.last_page || 1;
     if (page >= lastPage) return { ok: true };
     page += 1;
   }
@@ -144,14 +148,18 @@ const setSyncCheckpoint = async (pool, key, when) => {
 };
 
 /**
- * Mirrors a brand fully — id/name/full_name/country/logo (-> logo_url) all
- * come directly from EasyGas (field set confirmed on the old public
- * endpoint and corroborated by the stag-db product_brands dump; a row
- * missing id/name is skipped, never guessed at — see the file header).
- * Brands must come from EasyGas, never be locally invented (see
- * project architecture memory) — this upsert is the entire source of truth
- * for the `brands` table. Returns which of insert/update/unchanged happened,
- * read off MySQL's own affectedRows for the ON DUPLICATE KEY UPDATE (see the
+ * Mirrors a brand. The CONFIRMED real /brands item (production probe,
+ * 2026-08-26) carries ONLY {id, name} — no full_name/country/logo. The
+ * locally-stored descriptive columns (full_name/country/logo_url, populated
+ * by the old endpoint / the one-time stag-db migration) must therefore be
+ * PRESERVED, not overwritten with NULL on every sync: the ON DUPLICATE KEY
+ * UPDATE uses COALESCE(VALUES(col), col) so an absent incoming value keeps
+ * the existing stored one, while a real incoming value (if EasyGas ever
+ * returns these fields again) still updates it. A row missing id/name is
+ * skipped, never guessed at. Brands must come from EasyGas, never be
+ * locally invented — this upsert is the entire source of truth for the
+ * `brands` table. Returns which of insert/update/unchanged happened, read
+ * off MySQL's own affectedRows for the ON DUPLICATE KEY UPDATE (see the
  * STATUS DETAILS note in this file's header) — no extra query needed.
  */
 const upsertBrand = async (pool, brand) => {
@@ -159,21 +167,25 @@ const upsertBrand = async (pool, brand) => {
   const [result] = await pool.execute(
     `INSERT INTO brands (external_id, name, full_name, country, logo_url, synced_at)
      VALUES (?, ?, ?, ?, ?, NOW())
-     ON DUPLICATE KEY UPDATE name = VALUES(name), full_name = VALUES(full_name),
-       country = VALUES(country), logo_url = VALUES(logo_url), synced_at = VALUES(synced_at)`,
+     ON DUPLICATE KEY UPDATE name = VALUES(name),
+       full_name = COALESCE(VALUES(full_name), full_name),
+       country = COALESCE(VALUES(country), country),
+       logo_url = COALESCE(VALUES(logo_url), logo_url),
+       synced_at = VALUES(synced_at)`,
     [String(brand.id), brand.name, brand.full_name || null, brand.country || null, brand.logo || null]
   );
   return { outcome: result.affectedRows === 1 ? 'inserted' : result.affectedRows === 2 ? 'updated' : 'unchanged' };
 };
 
 /**
- * Brands via the signed GET {base}/brands endpoint. The old public
- * /product-brands endpoint returned all ~26 brands in one unpaginated
- * `{data: [...]}` response; the new endpoint is routed through the same
- * tolerant walkPaginatedCatalog as products/cars so an unpaginated response
- * still works (stops after page 1) and a paginated one is walked fully.
- * Each brand's upsert is individually try/caught so one malformed row can't
- * abort the rest of the batch — counts toward `failed` instead.
+ * Brands via the signed GET {base}/brands endpoint. CONFIRMED (production
+ * probe, 2026-08-26): the response is an UNPAGINATED `{ data: [...] }` —
+ * routed through the same tolerant walkPaginatedCatalog as products/cars,
+ * which correctly stops after page 1 for that shape (and would walk fully
+ * if EasyGas ever paginated it). The brand count is whatever EasyGas
+ * returns — never hardcoded. Each brand's upsert is individually try/caught
+ * so one malformed row can't abort the rest of the batch — counts toward
+ * `failed` instead.
  */
 const syncBrands = async (pool) => {
   const counts = { inserted: 0, updated: 0, skipped: 0, failed: 0, total: 0 };
@@ -204,10 +216,11 @@ const resolveBrandById = async (pool, externalBrandId) => {
   return rows[0] || null;
 };
 
-// The real category field is product_category_id (+ product_category_name
-// for the human label) — confirmed on the old public endpoint and
-// corroborated by the stag-db products dump. The endpoint returns EasyGas's
-// ENTIRE product line, and config/externalCategoryMap.js's whitelist is the
+// The real category field is product_category_id (confirmed on the new
+// endpoint's probe, 2026-08-26; the human label product_category_name is
+// NOT in the new shape — the confirmed `component_type` string is logged
+// instead as the diagnostic label). The endpoint returns EasyGas's ENTIRE
+// product line, and config/externalCategoryMap.js's id whitelist is the
 // real, routine filtering mechanism (the majority of products hit this
 // skip path — not a rare edge case). Tracks which unmapped ids have
 // already been logged so each of those categories logs once for diagnosis,
@@ -217,18 +230,21 @@ const loggedUnmappedCategories = new Set();
 /**
  * name has no separate "model" field in the real payload — for STAG products
  * specifically, `name` already includes the brand as a prefix (e.g. "STAG
- * 300-6 QMAX PLUS"), and since display code renders `${brand} ${model}`,
- * storing the raw name verbatim would show "STAG STAG 300-6 QMAX PLUS".
- * Strips a leading brand-name prefix (case-insensitive) when present so the
- * stored model never duplicates the brand; falls back to the full name
- * otherwise (most brands, e.g. ADAX/TOMASETTO ACHILLE, don't prefix at all).
+ * 300-6 QMAX PLUS", or hyphenated as in the probe-confirmed real item
+ * "STAG-200 GoFast-4"), and since display code renders `${brand} ${model}`,
+ * storing the raw name verbatim would show "STAG STAG-200 GoFast-4".
+ * Strips a leading brand-name prefix (case-insensitive) when present, plus
+ * any separator (whitespace or hyphen) immediately after it — so
+ * "STAG-200 GoFast-4" stores model "200 GoFast-4", never a leading-dash
+ * "-200 GoFast-4". Falls back to the full name otherwise (most brands,
+ * e.g. ADAX/TOMASETTO ACHILLE, don't prefix at all).
  */
 const deriveModel = (name, brandName) => {
   if (!name) return null;
   if (brandName) {
     const prefix = brandName.trim();
     if (prefix && name.toLowerCase().startsWith(prefix.toLowerCase())) {
-      const stripped = name.slice(prefix.length).trim();
+      const stripped = name.slice(prefix.length).replace(/^[\s-]+/, '').trim();
       if (stripped) return stripped;
     }
   }
@@ -269,18 +285,23 @@ const upsertProduct = async (pool, product) => {
     const key = String(product.product_category_id);
     if (!loggedUnmappedCategories.has(key)) {
       loggedUnmappedCategories.add(key);
+      // component_type (confirmed real field, e.g. "controller") is the best
+      // human-readable hint the new shape offers for diagnosing whether an
+      // unmapped id deserves a whitelist entry; product_category_name is
+      // read too in case it ever reappears.
+      const label = product.product_category_name || product.component_type || 'unknown';
       console.warn(
-        `[EasyGas Catalog Sync] Unmapped category id=${product.product_category_id} name="${product.product_category_name}" ` +
+        `[EasyGas Catalog Sync] Unmapped category id=${product.product_category_id} (label="${label}", example product="${product.name}") ` +
         `— skipping this and every future product in this category.`
       );
     }
-    return { outcome: 'skipped', reason: 'category', categoryId: product.product_category_id, categoryName: product.product_category_name };
+    return { outcome: 'skipped', reason: 'category', categoryId: product.product_category_id, categoryName: product.product_category_name || product.component_type || null };
   }
   const brand = await resolveBrandById(pool, product.product_brand_id);
   if (!brand) {
     console.warn(
-      `[EasyGas Catalog Sync] Product ${product.id} references brand_id ${product.product_brand_id} ` +
-      `(brand_name="${product.brand_name}") with no matching local brand — skipped, will retry once brands catch up`
+      `[EasyGas Catalog Sync] Product ${product.id} ("${product.name}") references product_brand_id ${product.product_brand_id} ` +
+      `with no matching local brand — skipped, will retry once brands catch up`
     );
     return { outcome: 'skipped', reason: 'brand' };
   }
@@ -350,12 +371,12 @@ const syncProducts = async (pool) => {
 
 /**
  * cars is its own upsert shape, not shared with upsertProduct — flat
- * brand/model strings (no brand_id FK, no category). Fields confirmed on
- * the old public endpoint (and corroborated by the stag-db cars dump): id,
- * brand_id (EasyGas's own, not resolved against our brands table here),
- * brand_name, name — there is no separate `model` field, `name` carries
- * it. A row missing id/brand_name/name is skipped, never guessed at (see
- * the file header). `is_active` reactivates on re-upsert
+ * brand/model strings (no brand FK, no category). CONFIRMED real item
+ * (production probe, 2026-08-26): { id, name, brand_name, updated_at } —
+ * there is no separate `model` field (`name` carries it), and the old
+ * endpoint's `brand_id` is gone (it was never read here anyway). A row
+ * missing id/brand_name/name is skipped, never guessed at (see the file
+ * header). `is_active` reactivates on re-upsert
  * (mirrors upsertProduct) — harmless now that sync never deactivates a row
  * itself (see the ARCHITECTURE DECISION note in this file's header), but
  * kept as a safe default in case is_active was ever set FALSE some other way.
@@ -375,11 +396,10 @@ const syncCars = async (pool) => {
   await getSyncCheckpoint(pool, 'cars'); // recorded for visibility only, see note above
   const [[{ startedAt }]] = await pool.execute('SELECT NOW() AS startedAt'); // see syncProducts for why not new Date()
   const counts = { inserted: 0, updated: 0, skipped: 0, failed: 0 };
-  // The old public /cars endpoint ignored `page`/`per_page` and returned all
-  // cars in one unpaginated `{data: [...]}` response; walkPaginatedCatalog's
-  // last_page fallback makes that shape (and a paginated one) both work
-  // against the new signed {base}/cars endpoint — see its doc comment.
-  // `.flat()` below is a no-op on a response that's already flat
+  // CONFIRMED (production probe, 2026-08-26): the new {base}/cars endpoint
+  // IS paginated, with the same top-level Laravel paginator shape as
+  // /products (`last_page` top-level) — walkPaginatedCatalog reads exactly
+  // that. `.flat()` below is a no-op on a response that's already flat
   // (Array.prototype.flat only descends into elements that are themselves
   // arrays) — kept as cheap insurance against a nested shape.
   const walk = await walkPaginatedCatalog(

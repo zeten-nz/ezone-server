@@ -140,6 +140,12 @@ const validateBarcode = async (connection, { barcode, product, equipmentType }) 
 };
 
 /**
+ * CURRENTLY UNWIRED (temporary product decision, 2026-08-26): the warranty
+ * workflow no longer performs inventory/barcode verification, so nothing
+ * calls this anymore. Kept (not deleted) because the disable is explicitly
+ * temporary — re-enabling means calling this again from
+ * warrantyService.resolveEquipment, exactly as before.
+ *
  * Manual Verification workflow — the one place that decides whether a
  * BARCODE_NOT_FOUND failure may be replaced with seller info instead of
  * blocking submission. Always calls validateBarcode first, exactly as the
@@ -208,6 +214,10 @@ const resolveOwnedPhotoFilename = async (connection, filename, uploadedBy) => {
 };
 
 /**
+ * CURRENTLY UNWIRED (temporary product decision, 2026-08-26): warranty
+ * creation no longer claims inventory — no caller exists. Kept for the
+ * eventual re-enable; see the note on validateBarcodeOrAcceptManual above.
+ *
  * Claims one inventory item for a warranty equipment row — the actual
  * enforcement point (see Design Decision B). Must be called from inside an
  * already-open transaction; never opens its own. Throws BARCODE_CLAIM_FAILED
@@ -230,6 +240,12 @@ const claimForEquipmentRow = async (connection, { itemId, productId, changedBy, 
 };
 
 /**
+ * CURRENTLY UNWIRED (temporary product decision, 2026-08-26): warranty
+ * update/delete no longer release inventory — no caller exists. An item
+ * left INSTALLED by the old flow is released via the Super-Admin manual
+ * operations below, never as a warranty side effect. Kept for the eventual
+ * re-enable; see the note on validateBarcodeOrAcceptManual above.
+ *
  * Releases one inventory item back to IN_STOCK (warranty edited or
  * deleted). Must be called from inside an already-open transaction that has
  * already acquired warrantyRepository.lockForm's FOR UPDATE lock on the

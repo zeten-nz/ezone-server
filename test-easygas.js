@@ -230,6 +230,14 @@ async function probeGetEndpoints() {
   const paths = ['/brands', '/products?page=1&per_page=2', '/cars?page=1&per_page=2', '/branches', '/verify'];
   for (const path of paths) {
     printSection(`GET ${BASE_URL}${path}`);
+    if (path === '/verify') {
+      // Confirmed contract (2026-08-26): /verify requires one of
+      // phone/vin/serial — a parameterless probe returning 422
+      // FIELD_REQUIRED is EXPECTED and proves auth succeeded (an invalid
+      // signature would 401 instead). Probed without params on purpose so
+      // no real customer phone/VIN/serial is ever sent by this tool.
+      console.log('NOTE: 422 FIELD_REQUIRED is the expected result here — /verify requires ?phone=|?vin=|?serial=.');
+    }
     const timestamp = Math.floor(Date.now() / 1000);
     const signatureHex = crypto.createHmac('sha256', SHARED_SECRET).update(`${timestamp}.`, 'utf8').digest('hex');
     let response;

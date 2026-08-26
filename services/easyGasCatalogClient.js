@@ -17,7 +17,13 @@ const { buildSignedHeaders } = require('../utils/easyGasSigning');
 // is `${timestamp}.` (trailing dot mandatory). No second HMAC
 // implementation exists anywhere; this file only ever calls the shared
 // buildSignedHeaders.
-const BASE_URL = process.env.EASYGAS_WARRANTY_API_BASE_URL;
+// Trailing slashes are stripped so a base URL configured as
+// ".../api/integrations/warranty/" still composes ".../warranty/brands",
+// never ".../warranty//brands". Paths below are appended verbatim — the
+// base can never be duplicated into the composed URL.
+const BASE_URL = process.env.EASYGAS_WARRANTY_API_BASE_URL
+  ? process.env.EASYGAS_WARRANTY_API_BASE_URL.replace(/\/+$/, '')
+  : process.env.EASYGAS_WARRANTY_API_BASE_URL;
 const SHARED_SECRET = process.env.EASYGAS_SHARED_SECRET;
 const REQUEST_TIMEOUT_MS = 15_000;
 
@@ -78,11 +84,15 @@ const getCars = (params) => request('GET', `/cars${toQueryString(params)}`);
 // verification/mapping use; nothing calls it in a sync.
 const getBranches = (params) => request('GET', `/branches${toQueryString(params)}`);
 
-// Integration verification endpoint. Its exact response contract is not
-// documented in this repository, so it is deliberately used ONLY as a
-// signed connectivity/health probe (see catalogSyncController's
-// verify endpoint) — nothing interprets its body, and no warranty or sync
-// behavior depends on it.
-const verify = () => request('GET', '/verify');
+// Verification/lookup endpoint — REAL CONTRACT (confirmed by a signed
+// production probe, 2026-08-26): requires exactly one of the query params
+// `phone`, `vin`, or `serial`; a parameterless call returns 422
+// `{success:false, errors:[{field:"query", code:"FIELD_REQUIRED", ...}]}`
+// (which is a validation rejection, NOT an auth failure — the signature was
+// accepted). Callers must always pass one of those params (enforced in
+// catalogSyncController.verifyEasyGasConnection); the success-response
+// shape is not yet captured, so the body is passed through uninterpreted.
+// No warranty or catalog-sync behavior depends on this endpoint.
+const verify = (params) => request('GET', `/verify${toQueryString(params)}`);
 
 module.exports = { getBrands, getProducts, getCars, getBranches, verify };
