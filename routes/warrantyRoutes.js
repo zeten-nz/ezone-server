@@ -85,11 +85,12 @@ const warrantyValidationRules = [
   body('equipment.*.product_id').optional({ nullable: true }).isInt().withMessage('Product id must be an integer when provided'),
   body('equipment.*.model').optional({ nullable: true }).trim().isLength({ max: 100 }).withMessage('Model must be 100 characters or fewer'),
   body('equipment.*.brand_name').optional({ nullable: true }).trim().isLength({ max: 150 }).withMessage('Brand name must be 150 characters or fewer'),
-  // Manual Verification workflow — shape only here; "required when
-  // manual_verification is true" is a cross-field business rule enforced in
-  // warrantyService (inventoryService.validateBarcodeOrAcceptManual's
-  // SELLER_INFO_REQUIRED), the same layering CYLINDER_MODEL_REQUIRED already
-  // uses for the typed-cylinder path rather than in express-validator.
+  // Manual Verification fields — the active workflow is DISABLED
+  // (warrantyService ignores these fields entirely now; see the TEMPORARY
+  // PRODUCT DECISION note there). The shape validators are deliberately
+  // kept so an older cached client that still sends them gets its
+  // submission accepted (the fields are simply not persisted) instead of a
+  // validation rejection.
   body('equipment.*.manual_verification').optional().isBoolean().withMessage('manual_verification must be a boolean'),
   body('equipment.*.seller_name').optional({ nullable: true, checkFalsy: true }).trim().isLength({ max: 255 }).withMessage('Seller name must be 255 characters or fewer'),
   body('equipment.*.seller_phone').optional({ nullable: true, checkFalsy: true }).trim().isLength({ max: 20 }).withMessage('Seller phone must be 20 characters or fewer'),
@@ -124,8 +125,10 @@ router.put('/:formId',    verifyToken, warrantyValidationRules, updateWarrantyFo
 router.get('/:formId',    verifyToken, authorizeRole('ADMIN'), getWarrantyFormDetail);
 router.delete('/:formId', verifyToken, authorizeRole('ADMIN'), deleteWarrantyForm);
 
-// Manual Verification workflow — admin reviews one equipment row directly
-// (addressed by its own id, not by formId+type). ADMIN-only, same as every
+// Manual Verification review — HISTORICAL-ONLY: the active workflow can no
+// longer produce a PENDING row, but these endpoints remain so warranties
+// submitted under the old flow can still be resolved (see
+// warrantyService.reviewManualVerification). ADMIN-only, same as every
 // other review/approval action in this app (registration requests).
 router.post('/equipment/:equipmentId/approve-verification', verifyToken, authorizeRole('ADMIN'), manualVerificationReviewRules, approveManualVerification);
 router.post('/equipment/:equipmentId/reject-verification', verifyToken, authorizeRole('ADMIN'), manualVerificationReviewRules, rejectManualVerification);

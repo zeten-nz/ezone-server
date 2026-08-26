@@ -1,12 +1,11 @@
 const { buildSignedHeaders } = require('../utils/easyGasSigning');
 
 // Same signed base URL/secret as the catalog client (see
-// easyGasCatalogClient.js) — EasyGas's own request, one shared credential
-// pair for both APIs. Unlike the catalog client, this URL is used as the
-// complete endpoint, not a prefix with an appended path: confirmed against
-// the real server (see the standalone test-easygas.js verification this
-// client's contract was proven against) that EASYGAS_WARRANTY_API_BASE_URL
-// is the full `.../api/integrations/warranty` URL, not a shared prefix.
+// easyGasCatalogClient.js) — one shared credential pair for the whole
+// integration. This URL is used as the complete POST endpoint (confirmed
+// against the real server via the standalone test-easygas.js verification);
+// the integration GET endpoints (/brands, /products, /cars, /branches,
+// /verify) live under it as sub-paths — see easyGasCatalogClient.js.
 const BASE_URL = process.env.EASYGAS_WARRANTY_API_BASE_URL;
 const SHARED_SECRET = process.env.EASYGAS_SHARED_SECRET;
 const REQUEST_TIMEOUT_MS = 15_000;

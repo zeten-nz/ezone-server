@@ -1,19 +1,25 @@
 const { buildSignedHeaders } = require('../utils/easyGasSigning');
 
-// EasyGas's catalog API — per EasyGas's own request, shares the SAME signed
-// secret as the private warranty-submission API (see easyGasWarrantyClient.js),
-// but lives under a DIFFERENT path on the same host: /public/api/... rather
-// than /api/integrations/warranty. EASYGAS_WARRANTY_API_BASE_URL is the full
-// warranty endpoint URL (e.g. https://admin.stag.uz/api/integrations/warranty)
-// — not usable as a string-concatenation prefix for the catalog paths, which
-// are confirmed real endpoints (not invented): /public/api/products,
-// /public/api/product-brands, /public/api/cars. ORIGIN below is just the
-// protocol+host portion of that same configured URL — no separate catalog
-// base URL env var exists or is introduced here (EASYGAS_CATALOG_API_BASE_URL
-// stays retired, per the prior note this replaces).
-const ORIGIN = process.env.EASYGAS_WARRANTY_API_BASE_URL ? new URL(process.env.EASYGAS_WARRANTY_API_BASE_URL).origin : undefined;
+// EasyGas's integration GET API. CURRENT CONTRACT (supersedes the retired
+// /public/api/{products,product-brands,cars} catalog paths — do not
+// reintroduce those): every GET endpoint lives under the SAME base URL the
+// warranty POST already uses (EASYGAS_WARRANTY_API_BASE_URL, e.g.
+// https://admin.stag.uz/api/integrations/warranty):
+//
+//   GET {base}/brands
+//   GET {base}/products
+//   GET {base}/cars
+//   GET {base}/branches
+//   GET {base}/verify
+//
+// All five are HMAC-signed with the shared EASYGAS_SHARED_SECRET via
+// utils/easyGasSigning.js — a GET signs an empty body, so the signing base
+// is `${timestamp}.` (trailing dot mandatory). No second HMAC
+// implementation exists anywhere; this file only ever calls the shared
+// buildSignedHeaders.
+const BASE_URL = process.env.EASYGAS_WARRANTY_API_BASE_URL;
 const SHARED_SECRET = process.env.EASYGAS_SHARED_SECRET;
-const REQUEST_TIMEOUT_MS = 3000;
+const REQUEST_TIMEOUT_MS = 15_000;
 
 const toQueryString = (params) => {
   if (!params) return '';
@@ -23,24 +29,29 @@ const toQueryString = (params) => {
 };
 
 /**
- * Pure HTTP client for EasyGas's public catalog API — never acquires or
- * holds a DB connection. This function NEVER rejects — network failures,
+ * Pure HTTP client for EasyGas's integration GET endpoints — never acquires
+ * or holds a DB connection. This function NEVER rejects — network failures,
  * timeouts, and JSON-parse failures all resolve to
- * `{ ok: false, networkError: true, ... }` instead of throwing, because the
- * only caller (the catalog sync sweep, services/easyGasCatalogSyncSweep.js)
- * runs in a detached setInterval context where an uncaught rejection would
- * trip server.js's unhandledRejection handler and kill the entire PM2 worker.
+ * `{ ok: false, networkError: true, ... }` instead of throwing, because one
+ * caller (the catalog sync sweep, services/easyGasCatalogSyncSweep.js) runs
+ * in a detached setInterval context where an uncaught rejection would trip
+ * server.js's unhandledRejection handler and kill the entire PM2 worker.
+ *
+ * Response-shape mapping deliberately does NOT live here — this client
+ * returns whatever JSON EasyGas sent, verbatim, and
+ * easyGasCatalogSyncService.js owns all field mapping (tolerantly, and
+ * fail-closed: an unrecognized shape is skipped/reported, never guessed at).
  */
 const request = async (method, path) => {
-  if (!ORIGIN) {
-    return { ok: false, status: 0, data: null, networkError: true, errorMessage: 'EASYGAS_WARRANTY_API_BASE_URL not configured' };
+  if (!BASE_URL || !SHARED_SECRET) {
+    return { ok: false, status: 0, data: null, networkError: true, errorMessage: 'EASYGAS_WARRANTY_API_BASE_URL/EASYGAS_SHARED_SECRET not configured' };
   }
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   try {
-    // GET-only client — every request signs an empty body.
+    // GET-only client — every request signs an empty body (`${timestamp}.`).
     const signedHeaders = buildSignedHeaders(SHARED_SECRET, '');
-    const response = await fetch(`${ORIGIN}${path}`, {
+    const response = await fetch(`${BASE_URL}${path}`, {
       method,
       headers: { 'Content-Type': 'application/json', ...signedHeaders },
       signal: controller.signal,
@@ -54,18 +65,24 @@ const request = async (method, path) => {
   }
 };
 
-// Confirmed real paths — do not change without a real, confirmed replacement.
-const getProducts = (params) => request('GET', `/public/api/products${toQueryString(params)}`);
-const getProductBrands = (params) => request('GET', `/public/api/product-brands${toQueryString(params)}`);
-const getCars = (params) => request('GET', `/public/api/cars${toQueryString(params)}`);
-// Branches endpoint — deliberately NEVER wired into any sync (FINAL
-// architecture decision: LOCAL branches are authoritative; branch_stag_code
-// comes from our own branches.code, and no EasyGas branch synchronization
-// exists or will be added — see easyGasWarrantySyncService.js's
-// branch_stag_code note). This function is dead-but-harmless: kept only so
-// the exported client surface doesn't change, path unconfirmed against the
-// current API (a /branches probe 404s; /public/api/branches 401s — neither
-// is used). Do not wire it into a sync without revisiting that decision.
+const getBrands = (params) => request('GET', `/brands${toQueryString(params)}`);
+const getProducts = (params) => request('GET', `/products${toQueryString(params)}`);
+const getCars = (params) => request('GET', `/cars${toQueryString(params)}`);
+
+// Branches: a confirmed real endpoint, but deliberately NOT wired into any
+// synchronization. LOCAL branches remain authoritative — branch identity,
+// employee assignment, and the branch_stag_code snapshot sent to EasyGas all
+// come from our own branches table (branches.code), and replacing that
+// ownership with an EasyGas pull would silently alter branch identity and
+// historical warranty snapshots. Exposed here only for future
+// verification/mapping use; nothing calls it in a sync.
 const getBranches = (params) => request('GET', `/branches${toQueryString(params)}`);
 
-module.exports = { getProducts, getProductBrands, getCars, getBranches };
+// Integration verification endpoint. Its exact response contract is not
+// documented in this repository, so it is deliberately used ONLY as a
+// signed connectivity/health probe (see catalogSyncController's
+// verify endpoint) — nothing interprets its body, and no warranty or sync
+// behavior depends on it.
+const verify = () => request('GET', '/verify');
+
+module.exports = { getBrands, getProducts, getCars, getBranches, verify };

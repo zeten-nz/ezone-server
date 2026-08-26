@@ -12,12 +12,24 @@
  * server, and only after two local, offline self-checks both pass.
  *
  * Usage:
- *   node test-easygas.js          — SAFE default: offline checks only
- *                                    (config, secret fingerprint, HMAC test
- *                                    vectors, payload build + signing
- *                                    diagnostics). Sends NOTHING.
- *   node test-easygas.js --send   — explicit opt-in: additionally performs
- *                                    the one real POST to EasyGas.
+ *   node test-easygas.js             — SAFE default: offline checks only
+ *                                       (config, secret fingerprint, HMAC test
+ *                                       vectors, payload build + signing
+ *                                       diagnostics). Sends NOTHING.
+ *   node test-easygas.js --probe-get — explicit opt-in: performs signed,
+ *                                       READ-ONLY GET requests against the
+ *                                       five integration GET endpoints
+ *                                       ({base}/brands, /products, /cars,
+ *                                       /branches, /verify) and prints each
+ *                                       response's STRUCTURE (status,
+ *                                       top-level keys, pagination fields,
+ *                                       first item) — run this once in
+ *                                       production to capture the confirmed
+ *                                       response shapes the catalog sync's
+ *                                       tolerant parser should be checked
+ *                                       against. Never POSTs anything.
+ *   node test-easygas.js --send      — explicit opt-in: additionally performs
+ *                                       the one real POST to EasyGas.
  *
  * Requires EASYGAS_WARRANTY_API_BASE_URL and EASYGAS_SHARED_SECRET — set
  * in ezone-server/.env (auto-loaded below) or exported in your shell.
@@ -30,6 +42,9 @@ const crypto = require('crypto');
 
 // Live network POST requires this explicit flag — see the gate in main().
 const LIVE_SEND = process.argv.includes('--send');
+// Read-only signed GET probes of the integration GET endpoints — separate
+// explicit flag; never combined with the POST path.
+const PROBE_GET = process.argv.includes('--probe-get');
 
 const BASE_URL = process.env.EASYGAS_WARRANTY_API_BASE_URL;
 const SHARED_SECRET = process.env.EASYGAS_SHARED_SECRET;
@@ -203,11 +218,72 @@ const STATUS_NOTES = {
   500: 'Internal Server Error — on EasyGas\'s side, not ours.',
 };
 
+/**
+ * Signed, READ-ONLY GET probes of the five integration GET endpoints —
+ * prints each response's structure so the exact production shapes can be
+ * captured and compared against what the catalog sync's tolerant parser
+ * expects (services/easyGasCatalogSyncService.js). GET only; no state is
+ * created or modified anywhere by these requests. Uses the same HMAC
+ * empty-body signing (`${timestamp}.`) as services/easyGasCatalogClient.js.
+ */
+async function probeGetEndpoints() {
+  const paths = ['/brands', '/products?page=1&per_page=2', '/cars?page=1&per_page=2', '/branches', '/verify'];
+  for (const path of paths) {
+    printSection(`GET ${BASE_URL}${path}`);
+    const timestamp = Math.floor(Date.now() / 1000);
+    const signatureHex = crypto.createHmac('sha256', SHARED_SECRET).update(`${timestamp}.`, 'utf8').digest('hex');
+    let response;
+    try {
+      response = await fetch(`${BASE_URL}${path}`, {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-EG-Timestamp': String(timestamp),
+          'X-EG-Signature': `sha256=${signatureHex}`,
+        },
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+    } catch (networkError) {
+      console.error('NETWORK ERROR — no response received:', networkError.message);
+      continue;
+    }
+    const rawText = await response.text();
+    let body = null;
+    try { body = rawText ? JSON.parse(rawText) : null; } catch { /* not JSON */ }
+    console.log('Status:', response.status, response.statusText);
+    if (body === null) {
+      console.log('Body is not JSON. First 500 chars of raw response:');
+      console.log(rawText.slice(0, 500));
+      continue;
+    }
+    if (Array.isArray(body)) {
+      console.log(`Shape: bare JSON array, length ${body.length}`);
+      if (body[0]) console.log('First item:', JSON.stringify(body[0], null, 2).slice(0, 1500));
+    } else {
+      console.log('Shape: object with top-level keys:', Object.keys(body).join(', '));
+      if (body.meta) console.log('meta:', JSON.stringify(body.meta));
+      if (body.links) console.log('links keys:', Object.keys(body.links).join(', '));
+      if (Array.isArray(body.data)) {
+        console.log(`data: array, length ${body.data.length}`);
+        if (body.data[0]) console.log('First item:', JSON.stringify(body.data[0], null, 2).slice(0, 1500));
+      } else {
+        console.log('Body:', JSON.stringify(body, null, 2).slice(0, 1500));
+      }
+    }
+  }
+}
+
 async function main() {
   assertConfig();
   verifySecretFingerprint();
   verifyOfficialTestVector();
   verifyOfficialGetTestVector();
+
+  if (PROBE_GET) {
+    await probeGetEndpoints();
+    printSection('GET PROBES COMPLETE — nothing was created or modified');
+    return; // never falls through into the POST path
+  }
 
   const payload = buildSamplePayload();
   // Serialized EXACTLY ONCE, right here. Every downstream use (signing,
@@ -249,7 +325,9 @@ async function main() {
   if (!LIVE_SEND) {
     printSection('DRY RUN — NO REQUEST SENT');
     console.log('All offline checks completed. Nothing was transmitted to EasyGas.');
-    console.log('To actually send the request above, re-run with the explicit flag:');
+    console.log('To probe the read-only integration GET endpoints (response shapes):');
+    console.log('\n  node test-easygas.js --probe-get\n');
+    console.log('To actually send the POST request above, re-run with the explicit flag:');
     console.log('\n  node test-easygas.js --send\n');
     return;
   }

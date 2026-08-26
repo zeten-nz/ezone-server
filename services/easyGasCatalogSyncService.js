@@ -8,25 +8,30 @@
  * context where manually acquiring/releasing a connection is pure risk for
  * no benefit).
  *
+ * ENDPOINTS (current contract): the signed GET endpoints under
+ * EASYGAS_WARRANTY_API_BASE_URL — {base}/brands, {base}/products,
+ * {base}/cars (see easyGasCatalogClient.js). These SUPERSEDE the retired
+ * /public/api/{products,product-brands,cars} paths this sync used before.
+ *
  * Field mapping (product_category_id, product_brand_id, station_type, name,
  * id on products; id/brand_id/brand_name/name on cars; id/name/full_name/
- * country/logo on brands) has been independently re-confirmed by directly
- * calling the live /public/api/products, /public/api/product-brands, and
- * /public/api/cars endpoints (they require no valid signature to return
- * data — see easyGasCatalogClient.js). CORRECTION to an earlier version of
- * this comment: /public/api/products does NOT pre-filter server-side to
- * warranty-relevant equipment — a live pull returned 207 products across 15
- * categories (hoses, oils, accessories, sensors, fittings, emulators, gas
- * valves, tubes, multivalves, repair kits, filters, plus the 4 warranty
- * ones), i.e. EasyGas's entire product line, same as before. The 84 that
- * actually end up in our `products` table are filtered entirely CLIENT-SIDE
- * by config/externalCategoryMap.js's 4-entry whitelist (mapExternalCategory
- * returning null for the other 123 is what does the real filtering — see
- * upsertProduct below) — this was already correct behavior, just documented
- * with the wrong reason. The paginated response shape genuinely is under a
- * `meta`/`links` wrapper as documented (see walkPaginatedCatalog) — that
- * part was confirmed correct. `component_type` still does not exist on any
- * real product, confirmed again live.
+ * country/logo on brands) was live-confirmed against the OLD public
+ * endpoints, which served the same underlying EasyGas entities (the
+ * stag-db dumps this project's one-time migration imported corroborate the
+ * same column set). The NEW endpoints' exact response envelopes have not
+ * yet been captured in this repository, so extraction below is deliberately
+ * TOLERANT (extractRows accepts both a bare JSON array and a
+ * `{data: [...]}` wrapper, paginated via `meta.last_page` when present) and
+ * every field mapping stays FAIL-CLOSED: a row that doesn't carry the
+ * expected fields is skipped and counted, never guessed at, and sync never
+ * deletes or deactivates anything — so a shape mismatch can only ever
+ * under-import (visible in the skip counts / FAILED status), never corrupt
+ * local data. Note /public/api/products did NOT pre-filter server-side to
+ * warranty-relevant equipment — filtering to the 4 warranty categories is
+ * entirely CLIENT-SIDE via config/externalCategoryMap.js's whitelist
+ * (mapExternalCategory returning null is what does the real filtering — see
+ * upsertProduct below); the same applies to the new endpoint until proven
+ * otherwise.
  *
  * ARCHITECTURE DECISION (final, per the catalog-sync-button update): EasyGas
  * is the single source of truth for brands/products/cars, but the app never
@@ -79,32 +84,40 @@
 const easyGasCatalogClient = require('./easyGasCatalogClient');
 const { mapExternalCategory } = require('../config/externalCategoryMap');
 
-const PAGE_SIZE = 100; // confirmed real max — per_page > 100 gets HTTP 422 "must not be greater than 100"
+const PAGE_SIZE = 100; // the old public API 422'd above 100; harmless if the new endpoint ignores it
 
 /**
- * Walks every page of the signed /public/api/products (and /cars) endpoint.
- * EasyGas's response shape (confirmed by EasyGas, current as of this
- * update): `{ data: [...], links: { next: ... }, meta: { current_page,
- * last_page, ... } }` — pagination fields live under `meta`, NOT top-level.
- * This is a real, confirmed change from the shape this function previously
- * assumed (top-level current_page/last_page, no meta wrapper) — that older
- * shape is no longer read anywhere. Stops as soon as a page fails (network
- * error or non-2xx) instead of skipping ahead, so a mid-walk failure just
- * means "try again next sweep cycle," never a silent gap. Deliberately NOT
- * used for brands — see syncBrands (brands is a single, unpaginated call).
- * Surfaces a short machine-readable `reason` on failure ('network' or
- * `http_<status>`) — same convention as syncBrands's existing failure
- * return — so runFullSync can report a real, specific Last Sync Message
- * instead of a bare "failed".
+ * Extracts the row array out of an EasyGas list response, tolerantly:
+ * accepts a Laravel-style `{ data: [...] }` wrapper (what the old public
+ * endpoints returned) OR a bare top-level JSON array. Anything else yields
+ * an empty array — fail-closed, the per-row upserts then simply have
+ * nothing to write and the counts make that visible.
+ */
+const extractRows = (data) => {
+  if (Array.isArray(data)) return data;
+  if (Array.isArray(data?.data)) return data.data;
+  return [];
+};
+
+/**
+ * Walks every page of a signed EasyGas list endpoint. Pagination fields are
+ * read tolerantly: `meta.last_page` (the Laravel wrapper the old public
+ * endpoints used) or a top-level `last_page`; when neither exists (an
+ * unpaginated response — a bare array or a plain `{data: [...]}`), the walk
+ * correctly stops after page 1, which then already contained everything.
+ * Stops as soon as a page fails (network error or non-2xx) instead of
+ * skipping ahead, so a mid-walk failure just means "try again next sweep
+ * cycle," never a silent gap. Surfaces a short machine-readable `reason` on
+ * failure ('network' or `http_<status>`) so runFullSync can report a real,
+ * specific Last Sync Message instead of a bare "failed".
  */
 const walkPaginatedCatalog = async (fetchPage, onPage) => {
   let page = 1;
   for (;;) {
     const result = await fetchPage(page);
     if (!result.ok) return { ok: false, reason: result.networkError ? 'network' : `http_${result.status}` };
-    const rows = result.data?.data || [];
-    await onPage(rows);
-    const lastPage = result.data?.meta?.last_page || 1;
+    await onPage(extractRows(result.data));
+    const lastPage = result.data?.meta?.last_page || result.data?.last_page || 1;
     if (page >= lastPage) return { ok: true };
     page += 1;
   }
@@ -132,8 +145,10 @@ const setSyncCheckpoint = async (pool, key, when) => {
 
 /**
  * Mirrors a brand fully — id/name/full_name/country/logo (-> logo_url) all
- * come directly from EasyGas, per the confirmed real /product-brands
- * response. Brands must come from EasyGas, never be locally invented (see
+ * come directly from EasyGas (field set confirmed on the old public
+ * endpoint and corroborated by the stag-db product_brands dump; a row
+ * missing id/name is skipped, never guessed at — see the file header).
+ * Brands must come from EasyGas, never be locally invented (see
  * project architecture memory) — this upsert is the entire source of truth
  * for the `brands` table. Returns which of insert/update/unchanged happened,
  * read off MySQL's own affectedRows for the ON DUPLICATE KEY UPDATE (see the
@@ -152,29 +167,35 @@ const upsertBrand = async (pool, brand) => {
 };
 
 /**
- * Confirmed: /product-brands returns all 26 brands in one unpaginated
- * `{data: [...]}` response (no `meta`/`links` at all) — deliberately NOT
- * routed through walkPaginatedCatalog, kept as its own single-call function.
+ * Brands via the signed GET {base}/brands endpoint. The old public
+ * /product-brands endpoint returned all ~26 brands in one unpaginated
+ * `{data: [...]}` response; the new endpoint is routed through the same
+ * tolerant walkPaginatedCatalog as products/cars so an unpaginated response
+ * still works (stops after page 1) and a paginated one is walked fully.
  * Each brand's upsert is individually try/caught so one malformed row can't
  * abort the rest of the batch — counts toward `failed` instead.
  */
 const syncBrands = async (pool) => {
-  const result = await easyGasCatalogClient.getProductBrands();
-  if (!result.ok) return { ok: false, reason: result.networkError ? 'network' : `http_${result.status}` };
-  const rows = result.data?.data || (Array.isArray(result.data) ? result.data : []);
-  const counts = { inserted: 0, updated: 0, skipped: 0, failed: 0 };
-  for (const brand of rows) {
-    try {
-      const { outcome } = await upsertBrand(pool, brand);
-      if (outcome === 'inserted') counts.inserted += 1;
-      else if (outcome === 'updated' || outcome === 'unchanged') counts.updated += 1;
-      else counts.skipped += 1;
-    } catch (error) {
-      counts.failed += 1;
-      console.warn(`[EasyGas Catalog Sync] Failed to upsert brand id=${brand?.id}: ${error.message}`);
+  const counts = { inserted: 0, updated: 0, skipped: 0, failed: 0, total: 0 };
+  const walk = await walkPaginatedCatalog(
+    (page) => easyGasCatalogClient.getBrands({ page, per_page: PAGE_SIZE }),
+    async (rows) => {
+      counts.total += rows.length;
+      for (const brand of rows) {
+        try {
+          const { outcome } = await upsertBrand(pool, brand);
+          if (outcome === 'inserted') counts.inserted += 1;
+          else if (outcome === 'updated' || outcome === 'unchanged') counts.updated += 1;
+          else counts.skipped += 1;
+        } catch (error) {
+          counts.failed += 1;
+          console.warn(`[EasyGas Catalog Sync] Failed to upsert brand id=${brand?.id}: ${error.message}`);
+        }
+      }
     }
-  }
-  return { ok: true, ...counts, total: rows.length };
+  );
+  if (!walk.ok) return { ok: false, reason: walk.reason };
+  return { ok: true, ...counts };
 };
 
 const resolveBrandById = async (pool, externalBrandId) => {
@@ -183,16 +204,14 @@ const resolveBrandById = async (pool, externalBrandId) => {
   return rows[0] || null;
 };
 
-// Confirmed real category field is product_category_id (+ product_category_name
-// for the human label) — component_type never existed in any real product.
-// CORRECTION to an earlier version of this comment: /public/api/products
-// does NOT pre-filter server-side — it returns EasyGas's entire product
-// line (confirmed live: 207 products across 15 categories). This is the
-// REAL, routine filtering mechanism (see config/externalCategoryMap.js's
-// header for the full live-verified breakdown) — a live pull hit this path
-// for 123 of 207 products (~59%), not a rare edge case. Tracks which
-// unmapped ids have already been logged so each of those categories logs
-// once for diagnosis, not once per product per sync cycle.
+// The real category field is product_category_id (+ product_category_name
+// for the human label) — confirmed on the old public endpoint and
+// corroborated by the stag-db products dump. The endpoint returns EasyGas's
+// ENTIRE product line, and config/externalCategoryMap.js's whitelist is the
+// real, routine filtering mechanism (the majority of products hit this
+// skip path — not a rare edge case). Tracks which unmapped ids have
+// already been logged so each of those categories logs once for diagnosis,
+// not once per product per sync cycle.
 const loggedUnmappedCategories = new Set();
 
 /**
@@ -331,13 +350,12 @@ const syncProducts = async (pool) => {
 
 /**
  * cars is its own upsert shape, not shared with upsertProduct — flat
- * brand/model strings (no brand_id FK, no category). Confirmed real fields
- * on the live endpoint: id, brand_id (EasyGas's own, not resolved against
- * our brands table here — out of scope of this fix), brand_name, name —
- * there is no separate `model` field, `name` carries it. CORRECTION to an
- * earlier version of this comment: there is no `updated_at` field on the
- * real object either (it listed one that doesn't exist — confirmed live,
- * never read by this code anyway). `is_active` reactivates on re-upsert
+ * brand/model strings (no brand_id FK, no category). Fields confirmed on
+ * the old public endpoint (and corroborated by the stag-db cars dump): id,
+ * brand_id (EasyGas's own, not resolved against our brands table here),
+ * brand_name, name — there is no separate `model` field, `name` carries
+ * it. A row missing id/brand_name/name is skipped, never guessed at (see
+ * the file header). `is_active` reactivates on re-upsert
  * (mirrors upsertProduct) — harmless now that sync never deactivates a row
  * itself (see the ARCHITECTURE DECISION note in this file's header), but
  * kept as a safe default in case is_active was ever set FALSE some other way.
@@ -357,23 +375,13 @@ const syncCars = async (pool) => {
   await getSyncCheckpoint(pool, 'cars'); // recorded for visibility only, see note above
   const [[{ startedAt }]] = await pool.execute('SELECT NOW() AS startedAt'); // see syncProducts for why not new Date()
   const counts = { inserted: 0, updated: 0, skipped: 0, failed: 0 };
-  // CORRECTION to an earlier version of this comment: a live call proved
-  // /public/api/cars ignores `page`/`per_page` entirely and always returns
-  // ALL cars (409, as of this correction) in one response with a plain
-  // `{data: [...]}` — no `meta`, no `links` at all, same unpaginated shape
-  // as /public/api/product-brands. It is NOT actually paginated, and
-  // `data` is a flat array of car objects, NOT an array of arrays (an
-  // earlier version of this comment claimed both of those incorrectly).
-  // Still routed through walkPaginatedCatalog rather than rewritten as a
-  // single call like syncBrands: with no `meta.last_page`, that helper's
-  // `result.data?.meta?.last_page || 1` fallback makes it stop after page 1
-  // — which is where everything already was, so this line has always
-  // fetched every car correctly (confirmed: 409 live vs 409 already synced),
-  // just for a different reason than originally documented. `.flat()` below
-  // is a no-op on a response that's already flat (Array.prototype.flat only
-  // descends into elements that are themselves arrays) — left in place as
-  // cheap insurance rather than restructuring this function, since it costs
-  // nothing today and would matter again if EasyGas's shape ever changes.
+  // The old public /cars endpoint ignored `page`/`per_page` and returned all
+  // cars in one unpaginated `{data: [...]}` response; walkPaginatedCatalog's
+  // last_page fallback makes that shape (and a paginated one) both work
+  // against the new signed {base}/cars endpoint — see its doc comment.
+  // `.flat()` below is a no-op on a response that's already flat
+  // (Array.prototype.flat only descends into elements that are themselves
+  // arrays) — kept as cheap insurance against a nested shape.
   const walk = await walkPaginatedCatalog(
     (page) => easyGasCatalogClient.getCars({ page, per_page: PAGE_SIZE }),
     async (rows) => {

@@ -1,5 +1,6 @@
 const { pool } = require('../config/database');
 const easyGasCatalogSyncService = require('../services/easyGasCatalogSyncService');
+const easyGasCatalogClient = require('../services/easyGasCatalogClient');
 
 /**
  * POST /api/catalog-sync/run — the ONE job the admin "Sync EasyGas Catalog"
@@ -48,4 +49,28 @@ const getCatalogSyncStatus = async (req, res, next) => {
   }
 };
 
-module.exports = { runCatalogSync, getCatalogSyncStatus };
+/**
+ * GET /api/catalog-sync/verify — signed connectivity check against
+ * EasyGas's GET {base}/verify endpoint (ADMIN-only, backend-to-backend;
+ * the browser never talks to admin.stag.uz directly). The endpoint's exact
+ * response contract is not documented in this repository, so this is
+ * deliberately a pure health probe: it reports whether a signed request
+ * succeeded (HTTP status + whatever body EasyGas returned, verbatim) and
+ * NOTHING else depends on it — warranty creation/approval and catalog sync
+ * never gate on this call.
+ */
+const verifyEasyGasConnection = async (req, res, next) => {
+  try {
+    const result = await easyGasCatalogClient.verify();
+    res.json({
+      ok: result.ok,
+      status: result.status,
+      networkError: result.networkError || false,
+      data: result.data,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+module.exports = { runCatalogSync, getCatalogSyncStatus, verifyEasyGasConnection };
