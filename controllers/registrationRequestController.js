@@ -2,6 +2,10 @@ const path = require('path');
 const fs = require('fs');
 const { pool } = require('../config/database');
 const { UPLOAD_DIR, PROFILE_UPLOAD_DIR } = require('../config/uploads');
+const { validationResult } = require('express-validator');
+const AppError = require('../utils/AppError');
+const managedEmployeeService = require('../services/managedEmployeeService');
+const { logBranchClassification } = managedEmployeeService;
 
 const getAllRegistrationRequests = async (req, res, next) => {
   let connection;
@@ -118,9 +122,30 @@ const streamRegistrationPhoto = async (req, res, next) => {
   }
 };
 
+/**
+ * Beta-2.1 HARDENING: EMPLOYEE accounts are admin-managed. A public
+ * applicant's arbitrary username must NOT become the final EMPLOYEE
+ * identity — at approval time the admin supplies the final MANAGED
+ * username (body.username; body.branch_id may also override the
+ * applicant's branch pick), and the exact same authoritative Beta-2 rule
+ * (managedEmployeeService.enforceForCreate — parse, prefix, branch-code
+ * match, branch classification, conflict, FOR UPDATE lock) runs inside
+ * THIS approval transaction, so approval + initial branch classification +
+ * employee creation commit or roll back as one operation. Without a
+ * managed override the applicant's own username fails
+ * INVALID_EMPLOYEE_USERNAME_FORMAT — no public path can produce an
+ * unmanaged final employee. Historical request rows are never modified
+ * beyond the existing status/review stamps; the applicant's original
+ * username stays visible on the request record.
+ */
 const approveRegistrationRequest = async (req, res, next) => {
   let connection;
   try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, message: errors.array()[0].msg, errorCode: 'VALIDATION_ERROR', timestamp: new Date().toISOString() });
+    }
+
     const { id } = req.params;
     connection = await pool.getConnection();
 
@@ -139,9 +164,15 @@ const approveRegistrationRequest = async (req, res, next) => {
       return res.status(409).json({ success: false, message: 'This request has already been reviewed', errorCode: 'INVALID_STATE', timestamp: new Date().toISOString() });
     }
 
+    // Final identity — admin-supplied managed username (falls back to the
+    // applicant's, which then fails the managed-format rule below whenever a
+    // branch is assigned) and admin-confirmed/overridden branch.
+    const finalUsername = (req.body.username || '').trim() || request.username;
+    const finalBranchId = req.body.branch_id || request.branch_id || null;
+
     const [existingUsers] = await connection.execute(
       'SELECT id FROM users WHERE username = ?',
-      [request.username]
+      [finalUsername]
     );
     if (existingUsers.length > 0) {
       return res.status(409).json({ success: false, message: 'Username already exists', errorCode: 'CONFLICT', timestamp: new Date().toISOString() });
@@ -151,16 +182,32 @@ const approveRegistrationRequest = async (req, res, next) => {
 
     await connection.beginTransaction();
 
-    await connection.execute(
+    // ONE business rule — the same service admin direct-create uses (never
+    // duplicated here). Locks the branch FOR UPDATE, validates the managed
+    // username against it, classifies a still-NULL branch, rejects
+    // mismatches/conflicts. Throws AppError → rolls back below.
+    const { parsed, classification } = await managedEmployeeService.enforceForCreate(connection, {
+      role: 'EMPLOYEE',
+      username: finalUsername,
+      branchId: finalBranchId,
+    });
+
+    // users.branch_code snapshot follows the FINAL branch (the managed
+    // username's reconstructed code equals that branch's code by rule);
+    // for a branchless approval it stays the applicant's original value.
+    const finalBranchCode = parsed ? parsed.branchCode : request.branch_code;
+
+    const [insertResult] = await connection.execute(
       `INSERT INTO users
         (full_name, first_name, last_name, username, password, phone, region, district, branch_id, branch_code, photo_filename, role, is_active)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
-        fullName, request.first_name, request.last_name, request.username, request.password_hash,
-        request.phone, request.region, request.district, request.branch_id, request.branch_code, request.photo_filename,
+        fullName, request.first_name, request.last_name, finalUsername, request.password_hash,
+        request.phone, request.region, request.district, finalBranchId, finalBranchCode, request.photo_filename,
         'EMPLOYEE', true,
       ]
     );
+    const newEmployeeId = insertResult.insertId;
 
     // Guarded on status = 'PENDING', not a bare `WHERE id = ?` — the earlier
     // check (line ~122) only rules out the common case; it can't see a
@@ -180,6 +227,8 @@ const approveRegistrationRequest = async (req, res, next) => {
     }
 
     await connection.commit();
+
+    logBranchClassification({ classification, actorId: req.user.id, employeeUsername: finalUsername, employeeId: newEmployeeId });
 
     // Best-effort: copy (not move) the applicant's photo into the
     // profile-photos directory so the new user has their own independent
@@ -201,6 +250,9 @@ const approveRegistrationRequest = async (req, res, next) => {
   } catch (error) {
     if (connection) {
       try { await connection.rollback(); } catch { /* connection already broken */ }
+    }
+    if (error instanceof AppError) {
+      return res.status(error.statusCode).json({ success: false, message: error.message, errorCode: error.errorCode, timestamp: new Date().toISOString() });
     }
     next(error);
   } finally {

@@ -7,8 +7,10 @@ const {
   updateBranch,
   disableBranch,
   enableBranch,
+  reclassifyBranch,
 } = require('../controllers/branchController');
-const { verifyToken, authorizeRole } = require('../middleware/auth');
+const { verifyToken, authorizeRole, requireSuperAdmin } = require('../middleware/auth');
+const { BRANCH_TYPES } = require('../config/branchTypes');
 
 const router = express.Router();
 
@@ -31,5 +33,17 @@ router.put('/:branchId', [
 
 router.patch('/:branchId/disable', disableBranch);
 router.patch('/:branchId/enable', enableBranch);
+
+// Beta-2.1: EXPLICIT corrective reclassification — Super-Admin-only (same
+// capability gate as points config / inventory manual ops). body.branch_type
+// is one of the canonical types, or null to reset to unclassified; every
+// consistency rule (managed-employee evidence, locking) is enforced in
+// managedEmployeeService.reclassifyBranch.
+router.patch('/:branchId/reclassify', requireSuperAdmin, [
+  body('branch_type').custom((value) => {
+    if (value === null || value === undefined || BRANCH_TYPES.includes(value)) return true;
+    throw new Error(`branch_type must be one of ${BRANCH_TYPES.join(', ')} or null`);
+  }),
+], reclassifyBranch);
 
 module.exports = router;

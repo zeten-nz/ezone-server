@@ -1,6 +1,18 @@
 const bcrypt = require('bcryptjs');
 const { pool } = require('../config/database');
 const { validationResult } = require('express-validator');
+const AppError = require('../utils/AppError');
+const managedEmployeeService = require('../services/managedEmployeeService');
+const { logBranchClassification } = managedEmployeeService; // one shared audit logger (Beta-2.1)
+
+const sendAppError = (res, error) => {
+  res.status(error.statusCode).json({
+    success: false,
+    message: error.message,
+    errorCode: error.errorCode,
+    timestamp: new Date().toISOString(),
+  });
+};
 
 const getAllUsers = async (req, res, next) => {
   let connection;
@@ -40,15 +52,41 @@ const createUser = async (req, res, next) => {
       return res.status(409).json({ success: false, message: 'Username already exists', errorCode: 'CONFLICT', timestamp: new Date().toISOString() });
     }
 
-    const hashedPassword = await bcrypt.hash(password, 10);
+    const hashedPassword = await bcrypt.hash(password, 10); // hashed BEFORE the transaction — never hold a row lock through CPU work
 
-    await connection.execute(
-      'INSERT INTO users (full_name, username, password, phone, branch_id, role, is_active) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      [full_name, username, hashedPassword, phone ?? null, branch_id || null, 'EMPLOYEE', true]
-    );
+    // Managed-employee enforcement + branch classification and the user
+    // INSERT form ONE transaction (Beta-2): the branch row is locked FOR
+    // UPDATE inside enforceForCreate, so "classify branch" and "create
+    // user" commit or roll back together — never a user without its
+    // classification, never a classification for a rolled-back user.
+    await connection.beginTransaction();
+    let insertedId;
+    let classification = null;
+    try {
+      ({ classification } = await managedEmployeeService.enforceForCreate(connection, {
+        role: 'EMPLOYEE', // this endpoint only ever creates EMPLOYEE accounts
+        username,
+        branchId: branch_id || null,
+      }));
 
+      const [insertResult] = await connection.execute(
+        'INSERT INTO users (full_name, username, password, phone, branch_id, role, is_active) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        [full_name, username, hashedPassword, phone ?? null, branch_id || null, 'EMPLOYEE', true]
+      );
+      insertedId = insertResult.insertId;
+
+      await connection.commit();
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    }
+
+    logBranchClassification({ classification, actorId: req.user.id, employeeUsername: username, employeeId: insertedId });
     res.status(201).json({ message: 'User created successfully' });
   } catch (error) {
+    if (error instanceof AppError) {
+      return sendAppError(res, error);
+    }
     next(error);
   } finally {
     if (connection) connection.release();
@@ -68,17 +106,48 @@ const updateUser = async (req, res, next) => {
 
     connection = await pool.getConnection();
 
-    const [result] = await connection.execute(
-      'UPDATE users SET full_name = ?, phone = ?, branch_id = ? WHERE id = ?',
-      [full_name, phone ?? null, branch_id || null, userId]
+    const [existingRows] = await connection.execute(
+      'SELECT id, username, role, branch_id FROM users WHERE id = ?',
+      [userId]
     );
-
-    if (result.affectedRows === 0) {
+    if (existingRows.length === 0) {
       return res.status(404).json({ success: false, message: 'User not found', errorCode: 'NOT_FOUND', timestamp: new Date().toISOString() });
     }
+    const existingUser = existingRows[0];
 
+    // Same one-transaction contract as createUser: branch classification
+    // (when a BRANCH CHANGE triggers it — username/role are immutable via
+    // this endpoint, and unchanged-branch edits are never enforced, so
+    // legacy-named employees keep working for unrelated edits) and the user
+    // UPDATE commit or roll back together.
+    await connection.beginTransaction();
+    let classification = null;
+    try {
+      ({ classification } = await managedEmployeeService.enforceForUpdate(connection, {
+        existingUser,
+        newBranchId: branch_id || null,
+      }));
+
+      const [result] = await connection.execute(
+        'UPDATE users SET full_name = ?, phone = ?, branch_id = ? WHERE id = ?',
+        [full_name, phone ?? null, branch_id || null, userId]
+      );
+      if (result.affectedRows === 0) {
+        throw new AppError('User not found', 404, 'NOT_FOUND'); // deleted concurrently — rolls back any classification
+      }
+
+      await connection.commit();
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    }
+
+    logBranchClassification({ classification, actorId: req.user.id, employeeUsername: existingUser.username, employeeId: existingUser.id });
     res.json({ message: 'User updated successfully' });
   } catch (error) {
+    if (error instanceof AppError) {
+      return sendAppError(res, error);
+    }
     next(error);
   } finally {
     if (connection) connection.release();

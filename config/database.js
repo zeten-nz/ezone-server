@@ -883,6 +883,20 @@ const initializeDatabase = async (loadMockData = false) => {
     // future migration.
     await ensureColumn(connection, 'branches', 'easygas_stag_code', 'easygas_stag_code VARCHAR(20) NULL AFTER code');
 
+    // Beta-2: branch business-group classification (config/branchTypes.js).
+    // ADDITIVE + NULLABLE — every existing branch boots as NULL
+    // ("Tayinlanmagan"/unclassified) and STAYS NULL until the authoritative
+    // managed-employee onboarding flow classifies it (see
+    // services/managedEmployeeService.js). Deliberately NO backfill of any
+    // kind: classification is never inferred from branch names/codes/import
+    // history and never sourced from EasyGas's /branches endpoint. NULL is
+    // independent of is_active — an active unclassified branch is fully
+    // valid/selectable.
+    await ensureColumn(
+      connection, 'branches', 'branch_type',
+      "branch_type ENUM('EASYGAS', 'STAG_SERVICE', 'OTHER_SERVICE') NULL DEFAULT NULL AFTER is_active"
+    );
+
     // cars.is_active: same soft-disable convention as products/brands/
     // branches — never hard-delete a car row: warranty_forms.car_id has a
     // real FK to it, and a historical warranty must keep resolving correctly
