@@ -21,3 +21,6 @@ dist/
 
 # Uploaded registration photos — PII, never committed
 uploads/
+
+
+.local-import/
