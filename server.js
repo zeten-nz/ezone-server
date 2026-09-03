@@ -87,7 +87,6 @@ const catalogSyncRoutes               = require('./routes/catalogSyncRoutes');
 const inventoryRoutes                 = require('./routes/inventoryRoutes');
 const pointsRoutes                    = require('./routes/pointsRoutes');
 const exportCsvRoutes                 = require('./routes/exportCsvRoutes');
-const publicCustomerRoutes            = require('./routes/publicCustomerRoutes');
 const { exportWarrantyForms, exportByBranch, exportEmployeeData } =
   require('./controllers/excelController');
 const { verifyToken, authorizeRole }  = require('./middleware/auth');
@@ -241,9 +240,10 @@ app.use('/api/catalog-sync', catalogSyncRoutes);
 app.use('/api/inventory', inventoryRoutes);
 app.use('/api/points', pointsRoutes);
 app.use('/api/export-csv', exportCsvRoutes);
-// Restored — see docs/09-security.md. Deliberately public (no verifyToken):
-// an explicitly-accepted trade-off, not an oversight.
-app.use('/api/public/customer', publicCustomerRoutes);
+// The unauthenticated POST /api/public/customer/warranties phone lookup was
+// RETIRED (Beta-1 security decision): phone-based access to customer +
+// vehicle + installed-equipment data now requires authentication — see
+// GET /api/warranty/lookup in routes/warrantyRoutes.js.
 app.get('/api/export/warranty', verifyToken, authorizeRole('ADMIN'), exportWarrantyForms);
 app.get('/api/export/branch',   verifyToken, authorizeRole('ADMIN'), exportByBranch);
 app.get('/api/export/employee', verifyToken, exportEmployeeData);

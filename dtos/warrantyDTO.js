@@ -80,4 +80,54 @@ const toWarrantyResponse = (form) => {
 
 const toWarrantyListResponse = (forms) => forms.map(toWarrantyResponse);
 
-module.exports = { toWarrantyResponse, toWarrantyListResponse };
+/**
+ * SAFE customer-lookup shape (Beta-1) — an explicit ALLOWLIST for the
+ * authenticated technician "find customer by phone" endpoint. Deliberately
+ * NOT toWarrantyResponse: that full shape carries admin/internal fields a
+ * service technician has no business seeing (easygas_sync_error,
+ * review_notes, reviewed_by, per-row Manual Verification seller data,
+ * inventory_item_id, submission_uuid, ...). Only service-relevant fields are
+ * mapped here — never spread `form`/`row`, always name each field, so a new
+ * DB column can never leak into this response by default.
+ *
+ * easygas_claim_url IS included: the employee's own Warranty History already
+ * legitimately exposes it (QR), and the returning customer is exactly who
+ * the claim QR is for.
+ */
+const toWarrantyLookupItem = (form) => ({
+  id: form.id,
+  warranty_book_number: form.warranty_book_number,
+  status: form.status,
+  created_at: form.created_at,
+  installation_date: form.installation_date,
+  owner_full_name: form.owner_full_name,
+  owner_phone: form.owner_phone,
+  vehicle_name: resolveVehicleName(form),
+  vehicle_plate_number: form.vehicle_plate_number,
+  vehicle_vin: form.vehicle_vin,
+  vehicle_production_year: form.vehicle_production_year,
+  vehicle_mileage: form.vehicle_mileage,
+  fuel_type: form.fuel_type,
+  installer: {
+    full_name: form.installer_full_name,
+    phone: form.installer_phone,
+    branch: form.installer_branch,
+    branch_code: form.installer_branch_code,
+  },
+  easygas_claim_url: form.easygas_claim_url,
+  equipment: (form.equipment || []).map((row) => ({
+    equipment_type: row.equipment_type,
+    product_name: row.product_name,
+    serial_number: row.serial_number,
+    // typed-cylinder historical fields — free-text brand+capacity rows
+    brand_name: row.brand_name,
+    model: row.model,
+  })),
+  // Historical pre-equipment-redesign rows only have the flat legacy fields
+  // — same fallback the detail modal uses, restricted to product+serial.
+  legacy_equipment: (form.equipment || []).length === 0 ? extractLegacyEquipment(form) : null,
+});
+
+const toWarrantyLookupResponse = (forms) => forms.map(toWarrantyLookupItem);
+
+module.exports = { toWarrantyResponse, toWarrantyListResponse, toWarrantyLookupResponse };

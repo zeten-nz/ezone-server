@@ -8,6 +8,7 @@ const {
   deleteWarrantyForm,
   searchWarrantyForms,
   getMyWarrantyForms,
+  lookupWarrantiesByPhone,
   approveManualVerification,
   rejectManualVerification,
   approveWarrantyForm,
@@ -117,6 +118,11 @@ router.post('/', verifyToken, warrantyValidationRules, createWarrantyForm);
 // Literal-string routes must come before /:formId to avoid Express treating them as IDs.
 router.get('/search', verifyToken, authorizeRole('ADMIN'), searchWarrantyForms);
 router.get('/my',     verifyToken, getMyWarrantyForms);
+// Customer lookup by phone — verifyToken only, BOTH roles (EMPLOYEE and
+// ADMIN), deliberately cross-installer/cross-branch: authentication is the
+// access boundary. Replaces the retired unauthenticated
+// POST /api/public/customer/warranties. See lookupWarrantiesByPhone.
+router.get('/lookup', verifyToken, lookupWarrantiesByPhone);
 
 router.get('/',    verifyToken, authorizeRole('ADMIN'), getAllWarrantyForms);
 

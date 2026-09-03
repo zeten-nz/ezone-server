@@ -8,8 +8,9 @@ const warrantyRepository = require('../repositories/warrantyRepository');
 const equipmentRepository = require('../repositories/equipmentRepository');
 const manualVerificationUploadRepository = require('../repositories/manualVerificationUploadRepository');
 const { attachEquipment } = require('../utils/warrantyEquipment');
-const { toWarrantyResponse, toWarrantyListResponse } = require('../dtos/warrantyDTO');
+const { toWarrantyResponse, toWarrantyListResponse, toWarrantyLookupResponse } = require('../dtos/warrantyDTO');
 const { verifyImageMagicBytes, MANUAL_VERIFICATION_UPLOAD_DIR } = require('../config/uploads');
+const { normalizePhone } = require('../utils/phoneFormat');
 
 const sendAppError = (res, error) => {
   res.status(error.statusCode).json({
@@ -396,6 +397,49 @@ const searchWarrantyForms = async (req, res, next) => {
   }
 };
 
+/**
+ * Authenticated customer lookup by phone (Beta-1) — the service-technician
+ * workflow: a customer returns months later, the technician enters their
+ * phone number and sees every warranty registered to it (vehicle, installed
+ * equipment + serials, installation date, installer/branch).
+ *
+ * Authorization: verifyToken only — BOTH roles (EMPLOYEE and ADMIN) may
+ * look up ANY customer's warranties, deliberately NOT scoped to
+ * req.user.id or the requester's branch: a customer can return to a
+ * different technician/branch and must still be identifiable.
+ * Authentication is the access boundary (the old unauthenticated
+ * POST /api/public/customer/warranties was retired in this same change).
+ *
+ * Phone comparison reuses the project's ONE normalization
+ * (utils/phoneFormat.normalizePhone → 9-digit national key) and the ONE
+ * repository comparison (findByOwnerPhone's parameterized
+ * RIGHT(REGEXP_REPLACE(...), 9) = ?) — no second implementation, no LIKE,
+ * no fuzzy search. Input that doesn't reduce to a full 9-digit key is
+ * rejected before any query runs. The response is the SAFE allowlisted
+ * lookup DTO (see toWarrantyLookupResponse) — never the full admin shape.
+ * Equipment is attached with ONE batched query for the whole result set
+ * (attachEquipment), never per warranty. The raw phone is not logged.
+ */
+const lookupWarrantiesByPhone = async (req, res, next) => {
+  let connection;
+  try {
+    const phone = normalizePhone(req.query.phone);
+    if (!phone || phone.length !== 9) {
+      return res.status(400).json({ success: false, message: 'A valid phone number is required', errorCode: 'VALIDATION_ERROR', timestamp: new Date().toISOString() });
+    }
+
+    connection = await pool.getConnection();
+    const rows = await warrantyRepository.findByOwnerPhone(connection, phone); // newest first (ORDER BY created_at DESC)
+    const forms = await attachEquipment(connection, rows);
+
+    res.json(toWarrantyLookupResponse(forms));
+  } catch (error) {
+    next(error);
+  } finally {
+    if (connection) connection.release();
+  }
+};
+
 const getMyWarrantyForms = async (req, res, next) => {
   let connection;
   try {
@@ -434,6 +478,7 @@ module.exports = {
   deleteWarrantyForm,
   searchWarrantyForms,
   getMyWarrantyForms,
+  lookupWarrantiesByPhone,
   approveManualVerification,
   rejectManualVerification,
   approveWarrantyForm,
