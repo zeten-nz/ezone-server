@@ -51,6 +51,35 @@ const COMPONENT_TYPE_MAP = {
   CYLINDER: 'cylinder',
 };
 
+/**
+ * Beta-3 NULL-CYLINDER contract (confirmed by the integration partner): a
+ * warranty without a cylinder still sends the cylinder ENTRY in the
+ * components array — the existing cylinder-specific fields are transmitted
+ * as JSON null, never omitted and never filled with fake values (no 0, no
+ * "N/A", no placeholder product ids/serials). Both documented cylinder
+ * variants' fields (catalog: product_id; typed: brand_name/model; shared:
+ * serial_number) are carried as null so the entry can never be mistaken for
+ * a real component regardless of which variant EasyGas reads. Inserted at
+ * the cylinder's canonical position (after the reducer) so component order
+ * matches every previously-sent payload.
+ */
+const NULL_CYLINDER_COMPONENT = Object.freeze({
+  component_type: 'cylinder',
+  serial_number: null,
+  product_id: null,
+  brand_name: null,
+  model: null,
+});
+
+const buildComponents = (equipment) => {
+  const components = equipment.map(buildComponent);
+  if (!equipment.some((row) => row.equipment_type === 'CYLINDER')) {
+    const reducerIndex = components.findIndex((c) => c.component_type === 'reducer');
+    components.splice(reducerIndex + 1, 0, { ...NULL_CYLINDER_COMPONENT });
+  }
+  return components;
+};
+
 const buildComponent = (row) => {
   const base = {
     component_type: COMPONENT_TYPE_MAP[row.equipment_type],
@@ -128,7 +157,7 @@ const buildPayload = (form, equipment, carExternalId) => ({
   vehicle_plate_number: form.vehicle_plate_number,
   owner_full_name: form.owner_full_name,
   owner_phone: form.owner_phone,
-  components: equipment.map(buildComponent),
+  components: buildComponents(equipment), // Beta-3: absent local cylinder → null-valued cylinder entry, never omitted
   external_ref: String(form.id),
 });
 

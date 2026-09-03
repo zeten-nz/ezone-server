@@ -6,7 +6,7 @@ const productRepository = require('../repositories/productRepository');
 const pointsService = require('./pointsService');
 const easyGasWarrantySyncService = require('./easyGasWarrantySyncService');
 
-const { REQUIRED_EQUIPMENT_TYPES } = equipmentRepository;
+const { REQUIRED_EQUIPMENT_TYPES, ALL_EQUIPMENT_TYPES } = equipmentRepository;
 const EDIT_WINDOW_HOURS = 24;
 
 const getEmployeeSnapshot = (connection, employeeId) => warrantyRepository.getEmployeeSnapshot(connection, employeeId);
@@ -57,11 +57,14 @@ const resolveEquipment = async (connection, equipmentInput, { requireSerials } =
   const rows = Array.isArray(equipmentInput) ? equipmentInput : [];
   const types = rows.map((r) => r.equipment_type);
   const uniqueTypes = new Set(types);
-  const isComplete = rows.length === REQUIRED_EQUIPMENT_TYPES.length
-    && uniqueTypes.size === REQUIRED_EQUIPMENT_TYPES.length
-    && REQUIRED_EQUIPMENT_TYPES.every((t) => uniqueTypes.has(t));
-  if (!isComplete) {
-    throw new AppError('All 4 equipment types are required, each exactly once', 400, 'EQUIPMENT_INCOMPLETE');
+  // Beta-3 invariant: REDUCER/CONTROLLER/INJECTOR_RAIL each exactly once;
+  // CYLINDER zero-or-one; nothing else, no duplicates of anything. A valid
+  // set is therefore 3 or 4 rows — never trust the count alone.
+  const isValid = uniqueTypes.size === types.length                         // no duplicates (incl. duplicate CYLINDER)
+    && types.every((t) => ALL_EQUIPMENT_TYPES.includes(t))                  // no unknown types
+    && REQUIRED_EQUIPMENT_TYPES.every((t) => uniqueTypes.has(t));           // all three required present
+  if (!isValid) {
+    throw new AppError('Reducer, controller and injector rail are each required exactly once; cylinder is optional', 400, 'EQUIPMENT_INCOMPLETE');
   }
 
   const resolved = [];
@@ -309,6 +312,28 @@ const updateWarrantyForm = async (connection, formId, userId, role, data) => {
       row.seller_phone = null;
       row.verification_comment = null;
       row.manual_verification_photo_filename = null;
+    }
+
+    // Beta-3: optional-cylinder REMOVAL. upsertMany never deletes, so a
+    // submitted set without CYLINDER while a CYLINDER row exists means the
+    // user removed it: reverse its points FIRST (the ledger's
+    // warranty_equipment_id FK is ON DELETE SET NULL — reversing after the
+    // delete could no longer find the rows), then delete exactly that one
+    // row by its bounded key. All inside this same locked transaction, so a
+    // later failure rolls back both. Removing an already-absent cylinder is
+    // a natural no-op (no existing row → nothing here runs), so a repeated
+    // removal can never double-reverse.
+    const submittedTypes = new Set(resolvedEquipment.map((row) => row.equipment_type));
+    const removedCylinder = existingByType.get('CYLINDER') && !submittedTypes.has('CYLINDER');
+    if (removedCylinder) {
+      const cylinderRow = existingByType.get('CYLINDER');
+      await pointsService.reverseForEquipmentRow(connection, {
+        warrantyFormId: formId,
+        warrantyEquipmentId: cylinderRow.id,
+        reason: 'warranty_updated_reassigned',
+        createdBy: userId,
+      });
+      await equipmentRepository.deleteByFormAndType(connection, formId, 'CYLINDER');
     }
 
     await warrantyRepository.update(connection, formId, data);

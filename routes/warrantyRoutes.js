@@ -73,11 +73,12 @@ const warrantyValidationRules = [
   // rule are additionally guarded at sync time (syncWarrantyForm's pre-POST
   // phone check) so a legacy shape can still never reach EasyGas.
   body('owner_phone').notEmpty().matches(PHONE_REGEX).withMessage('A valid Uzbekistan phone number is required (+998XXXXXXXXX)'),
-  // Exactly the 4 fixed equipment slots (Reducer/Cylinder/Controller/
-  // Injector Rail) — completeness (all 4, no duplicates) and product
-  // validity are enforced in warrantyService.resolveEquipment, since a
-  // shape-only check here can't confirm the product actually exists.
-  body('equipment').isArray({ min: 4, max: 4 }).withMessage('All 4 equipment types are required'),
+  // Beta-3: CYLINDER is optional — 3 rows (Reducer/Controller/Injector
+  // Rail) or 4 (plus Cylinder). Count alone is only a shape check; the
+  // authoritative invariant (each required type exactly once, cylinder
+  // zero-or-one, no unknowns/duplicates) and product validity live in
+  // warrantyService.resolveEquipment.
+  body('equipment').isArray({ min: 3, max: 4 }).withMessage('Reducer, controller and injector rail are required; cylinder is optional'),
   body('equipment.*.equipment_type').isIn(['REDUCER', 'CYLINDER', 'CONTROLLER', 'INJECTOR_RAIL']),
   // product_id is optional here (not just for cylinder) so the same rule
   // applies uniformly — resolveEquipment is the one place that actually

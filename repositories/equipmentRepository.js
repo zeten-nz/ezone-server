@@ -1,4 +1,12 @@
-const REQUIRED_EQUIPMENT_TYPES = ['REDUCER', 'CYLINDER', 'CONTROLLER', 'INJECTOR_RAIL'];
+// Beta-3 equipment invariant: CYLINDER is OPTIONAL (a customer may bring a
+// cylinder not purchased from us — the warranty still covers our supplied
+// equipment). The other three types remain strictly required, each exactly
+// once. A warranty without a cylinder has NO CYLINDER row at all — never a
+// null-placeholder row. ALL_EQUIPMENT_TYPES is the canonical DISPLAY order
+// (read/reporting code may still enumerate all four slots).
+const REQUIRED_EQUIPMENT_TYPES = ['REDUCER', 'CONTROLLER', 'INJECTOR_RAIL'];
+const OPTIONAL_EQUIPMENT_TYPES = ['CYLINDER'];
+const ALL_EQUIPMENT_TYPES = ['REDUCER', 'CYLINDER', 'CONTROLLER', 'INJECTOR_RAIL'];
 
 /**
  * Upserts each equipment row keyed by (warranty_form_id, equipment_type) —
@@ -143,4 +151,31 @@ const findByWarrantyFormIds = async (connection, formIds) => {
   return rows;
 };
 
-module.exports = { REQUIRED_EQUIPMENT_TYPES, upsertMany, findByWarrantyFormIds, findById, reviewVerification };
+/**
+ * Deletes ONE equipment row by its safe composite key (Beta-3) — used
+ * exclusively for removing an optional CYLINDER on warranty edit. Must run
+ * inside the caller's transaction, after warrantyRepository.lockForm and
+ * AFTER the row's points have been reversed (point_transactions'
+ * warranty_equipment_id FK is ON DELETE SET NULL, so reversing after the
+ * delete could no longer find the ledger rows). Deliberately NOT a generic
+ * "delete whatever is missing" reconciliation — the bounded key keeps the
+ * blast radius to exactly one row of one warranty.
+ */
+const deleteByFormAndType = async (connection, warrantyFormId, equipmentType) => {
+  const [result] = await connection.execute(
+    'DELETE FROM warranty_equipment WHERE warranty_form_id = ? AND equipment_type = ?',
+    [warrantyFormId, equipmentType]
+  );
+  return result.affectedRows;
+};
+
+module.exports = {
+  REQUIRED_EQUIPMENT_TYPES,
+  OPTIONAL_EQUIPMENT_TYPES,
+  ALL_EQUIPMENT_TYPES,
+  upsertMany,
+  findByWarrantyFormIds,
+  findById,
+  reviewVerification,
+  deleteByFormAndType,
+};

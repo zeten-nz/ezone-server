@@ -29,9 +29,9 @@ Shared by create, the employee's own edit modal, and the admin edit modal — on
 
 ### The most important frontend/backend gap this documentation pass found
 
-**Equipment is still 100% catalog-only for all 4 types, including the cylinder.** `config/equipmentCategories.js`'s `EQUIPMENT_TYPES` renders 4 fixed rows; each is a strict cascade — Brand `<Select>` → Product `<Autocomplete>` (disabled until a Brand is picked) → serial/barcode `<Input>` (disabled until a Product is picked). `validateWarrantyForm` requires `row.product` to be truthy for every row, cylinder included, with no text-input alternative anywhere.
+**Equipment entry is catalog-only, but the cylinder slot is now OPTIONAL (Beta-3).** `config/equipmentCategories.js`'s `EQUIPMENT_TYPES` renders the 4 canonical rows; the `CYLINDER` row starts disabled ("Tsilindr qo'shish" opt-in) and, when disabled, is omitted from the wire payload entirely (`toWireEquipment`). Each enabled row is a strict cascade — Brand `<Select>` → Product `<Autocomplete>` (disabled until a Brand is picked) → serial `<Input>` (disabled until a Product is picked). `validateWarrantyForm` (extracted to `src/utils/warrantyFormValidation.js`) requires `row.product` for every ENABLED row, except an enabled cylinder carrying existing typed identity (`brand_name`/`model` round-tripped from history).
 
-**This means the backend's typed-cylinder capability cannot currently be used by anyone.** The backend accepts a product-less cylinder; nothing in this frontend can produce one. This is the single largest implemented-but-unreachable gap in the system right now. Closing it is the first item in [11-roadmap.md](11-roadmap.md).
+**NEW typed cylinders still cannot be created from this frontend** (no free-text entry UI), but existing typed-cylinder warranties now round-trip through edit correctly instead of failing `CYLINDER_MODEL_REQUIRED`. Building a typed-cylinder creation UX remains a roadmap item in [11-roadmap.md](11-roadmap.md).
 
 ### What does work, confirmed
 
