@@ -48,9 +48,30 @@ const createWarrantyForm = async (req, res, next) => {
       }
     }
 
+    // Post-attempt read for the success screen — a FRESH short-lived
+    // connection (the create connection was already released before the
+    // EasyGas HTTP call, and must stay released). findCreateResult is a
+    // minimal ALLOWLISTED select — easygas_sync_error is deliberately never
+    // part of this response: an installer sees only "QR available or not",
+    // never raw vendor/internal error text. An idempotent replay
+    // (created:false) returns the SAME stored number/claim state without a
+    // second EasyGas POST (gated above) and without a second number.
+    connection = await pool.getConnection();
+    const createResult = await warrantyRepository.findCreateResult(connection, result.formId);
+    connection.release();
+    connection = null;
+
     res.status(result.created ? 201 : 200).json({
       message: result.created ? 'Warranty form submitted successfully' : 'Warranty form already submitted',
       id: result.formId,
+      warranty_book_number: createResult?.warranty_book_number ?? null,
+      fuel_type: createResult?.fuel_type ?? null,
+      status: createResult?.status ?? null,
+      // A row whose sync attempt crashed before recording (defensive catch
+      // above) has NULL stored — reported as FAILED here: locally saved,
+      // no QR available right now. The local create is still a success.
+      easygas_sync_result: createResult?.easygas_sync_result === 'SUCCESS' ? 'SUCCESS' : 'FAILED',
+      easygas_claim_url: createResult?.easygas_claim_url ?? null,
     });
   } catch (error) {
     if (error instanceof AppError) {
@@ -440,6 +461,48 @@ const lookupWarrantiesByPhone = async (req, res, next) => {
   }
 };
 
+/**
+ * Authenticated customer lookup by EasyGas QR — the companion to
+ * lookupWarrantiesByPhone above for the technician who is shown the QR
+ * inside the customer's EasyGas app instead of asking for a phone number.
+ *
+ * SECURITY CONTRACT (SSRF guard): the scanned QR value is an OPAQUE STRING.
+ * It is NEVER fetched, opened, resolved, or redirected-through by this
+ * server — no HTTP client call, no URL parsing, no remote request of any
+ * kind. The exact decoded string is compared against the stored
+ * warranty_forms.easygas_claim_url with a parameterized equality match
+ * (findByClaimUrl) and nothing else. The value is never logged.
+ *
+ * Same access boundary as the phone lookup: verifyToken only, BOTH roles,
+ * deliberately cross-installer/cross-branch. Same SAFE allowlisted lookup
+ * DTO, same array response shape (empty [] on no match) so the frontend
+ * feeds it into the identical results rendering.
+ */
+const lookupWarrantyByQr = async (req, res, next) => {
+  let connection;
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, message: errors.array()[0].msg, errorCode: 'VALIDATION_ERROR', timestamp: new Date().toISOString() });
+    }
+
+    // Exact decoded value, preserved verbatim (no trim/normalization) — the
+    // stored claim_url is EasyGas's own string and whitespace could only
+    // ever fail to match, never mis-match.
+    const qrValue = req.body.qr_value;
+
+    connection = await pool.getConnection();
+    const rows = await warrantyRepository.findByClaimUrl(connection, qrValue);
+    const forms = await attachEquipment(connection, rows);
+
+    res.json(toWarrantyLookupResponse(forms));
+  } catch (error) {
+    next(error);
+  } finally {
+    if (connection) connection.release();
+  }
+};
+
 const getMyWarrantyForms = async (req, res, next) => {
   let connection;
   try {
@@ -479,6 +542,7 @@ module.exports = {
   searchWarrantyForms,
   getMyWarrantyForms,
   lookupWarrantiesByPhone,
+  lookupWarrantyByQr,
   approveManualVerification,
   rejectManualVerification,
   approveWarrantyForm,

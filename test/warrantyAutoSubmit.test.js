@@ -83,17 +83,23 @@ test('§7 syncWarrantyForm FAILED → records FAILED + error, claim_url NULL, on
 });
 
 // ── controller gating: created→sync once, not-created→zero, sync error doesn't fail create ──
-async function runController(createResult, submitImpl) {
-  const orig = { create: warrantyService.createWarrantyForm, submit: warrantyService.submitWarrantyToEasyGas, getConn: pool.getConnection };
+async function runController(createResult, submitImpl, storedRow) {
+  const orig = { create: warrantyService.createWarrantyForm, submit: warrantyService.submitWarrantyToEasyGas, getConn: pool.getConnection, findCreate: wrepo.findCreateResult };
   const state = { submitCount: 0, released: 0 };
   warrantyService.createWarrantyForm = async () => createResult;
   warrantyService.submitWarrantyToEasyGas = async () => { state.submitCount += 1; if (submitImpl) return submitImpl(); };
+  // The post-attempt allowlisted read backing the success screen — defaults
+  // to a SUCCESS row; individual tests override via `storedRow`.
+  wrepo.findCreateResult = async (_conn, formId) => (storedRow !== undefined ? storedRow : {
+    id: formId, warranty_book_number: 'LPG-2026-000010', fuel_type: 'LPG', status: 'SUCCESSFUL',
+    easygas_sync_result: 'SUCCESS', easygas_claim_url: 'https://admin.stag.uz/w/test-claim-token',
+  });
   pool.getConnection = async () => ({ release() { state.released += 1; } });
   const res = mkRes();
   try {
     await controller.createWarrantyForm({ user: { id: 1 }, body: {} }, res, (e) => { throw e; });
   } finally {
-    warrantyService.createWarrantyForm = orig.create; warrantyService.submitWarrantyToEasyGas = orig.submit; pool.getConnection = orig.getConn;
+    warrantyService.createWarrantyForm = orig.create; warrantyService.submitWarrantyToEasyGas = orig.submit; pool.getConnection = orig.getConn; wrepo.findCreateResult = orig.findCreate;
   }
   return { res, state };
 }

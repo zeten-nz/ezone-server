@@ -163,8 +163,10 @@ const createWarrantyForm = async (connection, employeeId, data) => {
   try {
     // Assigned inside the transaction so a rolled-back submission releases
     // its number back rather than leaving a permanent gap — see
-    // warrantyRepository.getNextWarrantyNumber.
-    const warrantyBookNumber = await warrantyRepository.getNextWarrantyNumber(connection, new Date().getFullYear());
+    // warrantyRepository.getNextWarrantyNumber. The prefix comes from this
+    // warranty's own route-validated fuel_type (LPG/CNG) — never derived
+    // from equipment, never client-chosen beyond that closed enum.
+    const warrantyBookNumber = await warrantyRepository.getNextWarrantyNumber(connection, new Date().getFullYear(), data.fuel_type);
     const formId = await warrantyRepository.insert(connection, employeeId, snapshot, data, warrantyBookNumber);
 
     // No inventory claim happens here anymore — see the TEMPORARY PRODUCT

@@ -39,23 +39,39 @@ const getEmployeeSnapshot = async (connection, employeeId) => {
 };
 
 /**
- * Local, sequential, per-year warranty numbering (W-2026-000001, ...) —
- * EZONE's own, with no external dependency. Atomic under concurrent
- * submissions via the documented MySQL idiom for emulating a sequence on a
- * non-AUTO_INCREMENT column: `LAST_INSERT_ID(expr)` in BOTH the INSERT's
- * VALUES and the ON DUPLICATE KEY UPDATE clause sets the session's
- * last-insert-id to `expr` either way, so `result.insertId` is correct
- * whether this is the first warranty of the year (fresh row) or the Nth
- * (existing row incremented) — using only the VALUES-clause literal would
- * leave insertId wrong (stale/0) on that first-of-the-year branch.
+ * Local, sequential, per-year warranty numbering — EZONE's own, with no
+ * external dependency. Atomic under concurrent submissions via the
+ * documented MySQL idiom for emulating a sequence on a non-AUTO_INCREMENT
+ * column: `LAST_INSERT_ID(expr)` in BOTH the INSERT's VALUES and the ON
+ * DUPLICATE KEY UPDATE clause sets the session's last-insert-id to `expr`
+ * either way, so `result.insertId` is correct whether this is the first
+ * warranty of the year (fresh row) or the Nth (existing row incremented) —
+ * using only the VALUES-clause literal would leave insertId wrong
+ * (stale/0) on that first-of-the-year branch.
+ *
+ * Fuel-aware prefix (2026-09): new numbers are `LPG-2026-000010` /
+ * `CNG-2026-000011` after the fuel type of the installation, replacing the
+ * old `W-` prefix for NEW warranties only — historical W-… rows are never
+ * rewritten. ONE shared yearly sequence deliberately backs both prefixes
+ * (the same warranty_number_sequences row per year): no per-fuel counters,
+ * no duplicated numerals across prefixes, and the existing atomicity and
+ * yearly continuity survive untouched. The prefix is validated against a
+ * closed allowlist here — the caller (warrantyService) passes its already
+ * route-validated data.fuel_type, and nothing client-controlled can ever
+ * become an arbitrary prefix.
  */
-const getNextWarrantyNumber = async (connection, year) => {
+const WARRANTY_NUMBER_PREFIXES = ['LPG', 'CNG'];
+
+const getNextWarrantyNumber = async (connection, year, fuelType) => {
+  if (!WARRANTY_NUMBER_PREFIXES.includes(fuelType)) {
+    throw new Error(`Invalid fuel type for warranty numbering: ${String(fuelType)}`);
+  }
   const [result] = await connection.execute(
     `INSERT INTO warranty_number_sequences (year, last_number) VALUES (?, LAST_INSERT_ID(1))
      ON DUPLICATE KEY UPDATE last_number = LAST_INSERT_ID(last_number + 1)`,
     [year]
   );
-  return `W-${year}-${String(result.insertId).padStart(6, '0')}`;
+  return `${fuelType}-${year}-${String(result.insertId).padStart(6, '0')}`;
 };
 
 const insert = async (connection, employeeId, snapshot, data, warrantyBookNumber) => {
@@ -301,6 +317,45 @@ const findByOwnerPhone = async (connection, normalizedPhone) => {
   return rows;
 };
 
+/**
+ * QR customer lookup — the scanned QR value is treated as an OPAQUE
+ * identifier and compared for EXACT equality against the stored
+ * easygas_claim_url (parameterized `= ?`): no LIKE, no substring search, no
+ * URL parsing, and — critically — the value is NEVER fetched over the
+ * network by us (SSRF guard; the QR encodes a URL for the CUSTOMER's phone
+ * to open, not for this server). Same SELECT/JOIN shape and safe-DTO
+ * consumers as findByOwnerPhone above. At most one row can realistically
+ * match (claim URLs are unique per warranty on the EasyGas side), but the
+ * array shape is kept so callers reuse the phone-lookup response path
+ * verbatim.
+ */
+const findByClaimUrl = async (connection, claimUrl) => {
+  const [rows] = await connection.execute(
+    `SELECT wf.*, u.full_name AS employee_name, u.username AS employee_username, ${FUEL_TYPE_SELECT}
+     FROM warranty_forms wf JOIN users u ON wf.employee_id = u.id
+     ${FUEL_TYPE_JOIN}
+     WHERE wf.easygas_claim_url = ?
+     ORDER BY wf.created_at DESC`,
+    [claimUrl]
+  );
+  return rows;
+};
+
+/**
+ * Minimal allowlisted read backing the CREATE response (post-EasyGas-
+ * attempt) — deliberately NOT findDetailById: the employee create UI gets
+ * only these fields, so a new column (or easygas_sync_error) can never leak
+ * into that response by default.
+ */
+const findCreateResult = async (connection, formId) => {
+  const [rows] = await connection.execute(
+    `SELECT id, warranty_book_number, fuel_type, status, easygas_sync_result, easygas_claim_url
+     FROM warranty_forms WHERE id = ?`,
+    [formId]
+  );
+  return rows[0] || null;
+};
+
 const deleteById = async (connection, formId) => {
   // warranty_equipment rows for this form are cleaned up automatically via
   // ON DELETE CASCADE — no manual unlink step needed (unlike the old
@@ -368,6 +423,8 @@ module.exports = {
   findDetailById,
   searchForms,
   findByOwnerPhone,
+  findByClaimUrl,
+  findCreateResult,
   deleteById,
   findChunkForExport,
 };

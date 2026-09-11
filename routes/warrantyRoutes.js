@@ -9,6 +9,7 @@ const {
   searchWarrantyForms,
   getMyWarrantyForms,
   lookupWarrantiesByPhone,
+  lookupWarrantyByQr,
   approveManualVerification,
   rejectManualVerification,
   approveWarrantyForm,
@@ -124,6 +125,18 @@ router.get('/my',     verifyToken, getMyWarrantyForms);
 // access boundary. Replaces the retired unauthenticated
 // POST /api/public/customer/warranties. See lookupWarrantiesByPhone.
 router.get('/lookup', verifyToken, lookupWarrantiesByPhone);
+// Customer lookup by scanned EasyGas QR — same verifyToken-only access
+// boundary as /lookup above. POST (not GET) so the scanned value travels in
+// the body, never in a URL/query that access logs would capture. The value
+// is an opaque string matched EXACTLY against the stored easygas_claim_url
+// — the server never fetches or parses it (SSRF guard; see
+// lookupWarrantyByQr). No .trim(): the exact decoded value is preserved.
+router.post('/lookup/qr', verifyToken, [
+  body('qr_value')
+    .exists({ checkNull: true }).withMessage('qr_value is required')
+    .isString().withMessage('qr_value must be a string')
+    .isLength({ min: 1, max: 2048 }).withMessage('qr_value must be 1-2048 characters'),
+], lookupWarrantyByQr);
 
 router.get('/',    verifyToken, authorizeRole('ADMIN'), getAllWarrantyForms);
 
