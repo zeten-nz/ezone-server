@@ -111,6 +111,19 @@ async function ensureColumnCollation(connection, table, column, definition) {
   }
 }
 
+async function ensureEquipmentSerialText(connection) {
+  const [rows] = await connection.execute(
+    "SELECT DATA_TYPE, IS_NULLABLE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'warranty_equipment' AND COLUMN_NAME = 'serial_number'"
+  );
+  if (!rows.length) return;
+  const wideTypes = ['text', 'mediumtext', 'longtext'];
+  const currentType = rows[0].DATA_TYPE;
+  if (!wideTypes.includes(currentType) || rows[0].IS_NULLABLE !== 'YES') {
+    const target = wideTypes.includes(currentType) ? currentType.toUpperCase() : 'TEXT';
+    await connection.execute(`ALTER TABLE warranty_equipment MODIFY COLUMN serial_number ${target} NULL`);
+  }
+}
+
 async function ensureNullableColumn(connection, table, column, definition) {
   const [rows] = await connection.execute(
     `SELECT IS_NULLABLE FROM information_schema.COLUMNS
@@ -753,7 +766,7 @@ const initializeDatabase = async (loadMockData = false) => {
         fuel_type                    ENUM('LPG', 'CNG') NULL,
         product_id                   INT NOT NULL,
         product_name                 VARCHAR(200) NOT NULL,
-        serial_number                VARCHAR(150) NULL,
+        serial_number                TEXT NULL,
         equipment_validation_status  ENUM('PENDING', 'VALID', 'INVALID') NOT NULL DEFAULT 'PENDING',
         validated_at                 TIMESTAMP NULL DEFAULT NULL,
         reward_points                INT NULL,
@@ -1180,6 +1193,7 @@ const initializeDatabase = async (loadMockData = false) => {
     // field, so a cylinder may be entered as free text (brand_name +
     // model/capacity) instead of a catalog product_id. The other 3
     // equipment types are unaffected and still always require one.
+    await ensureEquipmentSerialText(connection);
     await ensureNullableColumn(connection, 'warranty_equipment', 'product_id', 'product_id INT NULL');
     await ensureColumn(connection, 'warranty_equipment', 'brand_name', 'brand_name VARCHAR(150) NULL AFTER serial_number');
     await ensureColumn(connection, 'warranty_equipment', 'model', 'model VARCHAR(100) NULL AFTER brand_name');
@@ -1302,4 +1316,4 @@ const initializeDatabase = async (loadMockData = false) => {
   }
 };
 
-module.exports = { pool, initializeDatabase };
+module.exports = { pool, initializeDatabase, ensureEquipmentSerialText };

@@ -82,7 +82,7 @@ test('20.1/2/3 create with only the 3 required types succeeds — exactly 3 rows
   assert.equal(state.upserted.length, 3);
   assert.ok(!state.upserted.some((r2) => r2.equipment_type === 'CYLINDER'));
   assert.ok(state.upserted.every((r2) => r2.product_id !== null && r2.serial_number));
-  assert.equal(state.awards.length, 3); // points for the 3 present rows only (20.5→Part 4)
+  assert.equal(state.awards.length, 0); // warranty installs no longer earn points
 });
 
 test('20.4/14 create with all 4 (catalog cylinder) still succeeds', async () => {
@@ -90,7 +90,7 @@ test('20.4/14 create with all 4 (catalog cylinder) still succeeds', async () => 
   const result = await createForm([R(), CYL(), C(), I()]);
   assert.equal(result.created, true);
   assert.equal(state.upserted.length, 4);
-  assert.equal(state.awards.length, 4);
+  assert.equal(state.awards.length, 0);
 });
 
 test('20.5/6/7 each missing REQUIRED type is rejected', async () => {
@@ -114,8 +114,8 @@ test('20.11 unknown equipment type rejected', async () => {
 });
 
 test('20.12 malformed present cylinder rejected (catalog without serial; typed without model)', async () => {
-  await assert.rejects(() => createForm([R(), C(), I(), CYL({ serial_number: null })]), (e) => e.errorCode === 'BARCODE_REQUIRED');
-  await assert.rejects(() => createForm([R(), C(), I(), { equipment_type: 'CYLINDER', product_id: null, model: '  ' }]), (e) => e.errorCode === 'CYLINDER_MODEL_REQUIRED');
+  await assert.rejects(() => createForm([R(), C(), I(), CYL({ serial_number: null })]), (e) => e.errorCode === 'SERIAL_COUNT_INVALID');
+  await assert.rejects(() => createForm([R(), C(), I(), { equipment_type: 'CYLINDER', product_id: null, model: '  ', serial_number: 'S' }]), (e) => e.errorCode === 'CYLINDER_MODEL_REQUIRED');
 });
 
 test('20.13 inactive cylinder catalog product still rejected — optionality does not bypass enforcement', async () => {
@@ -219,7 +219,7 @@ test('22.27/29 no-cylinder EasyGas FAILURE records FAILED and never throws/rolls
 // ══ Part 23 — update / remove ══
 const update = (equipment) => warrantyService.updateWarrantyForm(conn, 77, 9, 'ADMIN', { equipment });
 
-test('23.30/31/32 removing an existing cylinder deletes exactly that row, keeps the other 3, reverses its points once (reverse BEFORE delete)', async () => {
+test('23.30/31/32 removing an existing cylinder deletes exactly that row, keeps the other 3, produces no point side effects', async () => {
   state.existingRows = [stored('REDUCER'), stored('CYLINDER'), stored('CONTROLLER'), stored('INJECTOR_RAIL')];
   const order = [];
   const origReverse = pointsService.reverseForEquipmentRow;
@@ -233,9 +233,8 @@ test('23.30/31/32 removing an existing cylinder deletes exactly that row, keeps 
     erepo.deleteByFormAndType = origDelete;
   }
   assert.deepEqual(state.deleted, [{ formId: 77, type: 'CYLINDER' }]);
-  assert.equal(state.reversals.length, 1);
-  assert.equal(state.reversals[0].warrantyEquipmentId, 202); // the cylinder row
-  assert.deepEqual(order, ['reverse', 'delete']); // FK is ON DELETE SET NULL — must reverse first
+  assert.equal(state.reversals.length, 0);
+  assert.deepEqual(order, ['delete']); // no new point ledger entries
   assert.equal(state.upserted.length, 3);
   assert.ok(!state.upserted.some((r2) => r2.equipment_type === 'CYLINDER'));
   assert.equal(state.awards.length, 0); // unchanged rows re-award nothing
@@ -248,7 +247,7 @@ test('23.33 removing again (already absent) is a no-op — no delete, no double 
   assert.equal(state.reversals.length, 0);
 });
 
-test('23.34/35 adding a cylinder to a no-cylinder warranty creates the row and awards its points exactly once', async () => {
+test('23.34/35 adding a cylinder to a no-cylinder warranty creates the row and produces no point awards', async () => {
   state.existingRows = [stored('REDUCER'), stored('CONTROLLER'), stored('INJECTOR_RAIL')];
   const afterRows = [stored('REDUCER'), stored('CYLINDER'), stored('CONTROLLER'), stored('INJECTOR_RAIL')];
   let call = 0;
@@ -260,11 +259,10 @@ test('23.34/35 adding a cylinder to a no-cylinder warranty creates the row and a
   }
   assert.equal(state.deleted.length, 0);
   assert.equal(state.upserted.length, 4);
-  assert.equal(state.awards.length, 1);
-  assert.equal(state.awards[0].equipmentType, 'CYLINDER');
+  assert.equal(state.awards.length, 0);
 });
 
-test('23.36 catalog → typed cylinder transition reverses and re-awards that one row', async () => {
+test('23.36 catalog → typed cylinder transition produces no point side effects', async () => {
   state.existingRows = [stored('REDUCER'), stored('CYLINDER'), stored('CONTROLLER'), stored('INJECTOR_RAIL')];
   const afterRows = [stored('REDUCER'), stored('CYLINDER', { product_id: null, brand_name: 'GZWM', model: '60L' }), stored('CONTROLLER'), stored('INJECTOR_RAIL')];
   let call = 0;
@@ -275,22 +273,22 @@ test('23.36 catalog → typed cylinder transition reverses and re-awards that on
     erepo.findByWarrantyFormIds = async () => state.existingRows.map((r2) => ({ ...r2 }));
   }
   assert.equal(state.deleted.length, 0); // transition, not removal
-  assert.equal(state.reversals.length, 1);
-  assert.equal(state.awards.length, 1);
+  assert.equal(state.reversals.length, 0);
+  assert.equal(state.awards.length, 0);
 });
 
-test('23.37 typed → no-cylinder removes the typed row safely (reverse + delete)', async () => {
+test('23.37 typed → no-cylinder removes the typed row safely (no point reversal)', async () => {
   state.existingRows = [stored('REDUCER'), stored('CYLINDER', { product_id: null, brand_name: 'GZWM', model: '60L' }), stored('CONTROLLER'), stored('INJECTOR_RAIL')];
   await update(THREE());
   assert.deepEqual(state.deleted, [{ formId: 77, type: 'CYLINDER' }]);
-  assert.equal(state.reversals.length, 1);
+  assert.equal(state.reversals.length, 0);
 });
 
-test('23.38 a failure AFTER removal rolls the transaction back (reverse+delete live inside the same locked tx)', async () => {
+test('23.38 a failure AFTER removal rolls the transaction back (delete lives inside the same locked tx)', async () => {
   state.existingRows = [stored('REDUCER'), stored('CYLINDER'), stored('CONTROLLER'), stored('INJECTOR_RAIL')];
   state.upsertShouldThrow = true;
   await assert.rejects(() => update(THREE()));
-  assert.equal(state.rollbacks, 1); // the real DB then discards the DELETE and the reversal insert together
+  assert.equal(state.rollbacks, 1); // the real DB discards the DELETE
   assert.equal(state.commits, 0);
 });
 

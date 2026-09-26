@@ -1,3 +1,4 @@
+const { parseSerialNumbers } = require('../utils/equipmentSerials');
 /**
  * Maps a raw warranty_forms row (+ attached `equipment`, see
  * utils/warrantyEquipment.js) to the public API shape. This is the one
@@ -71,7 +72,7 @@ const toWarrantyResponse = (form) => {
     vehicle_mileage: form.vehicle_mileage,
     owner_full_name: form.owner_full_name,
     owner_phone: form.owner_phone,
-    equipment,
+    equipment: equipment.map((row) => ({ ...row, serial_numbers: parseSerialNumbers(row.serial_number) })),
     legacy_equipment: equipment.length === 0 ? extractLegacyEquipment(form) : null,
     created_at: form.created_at,
     updated_at: form.updated_at,
@@ -119,6 +120,7 @@ const toWarrantyLookupItem = (form) => ({
     equipment_type: row.equipment_type,
     product_name: row.product_name,
     serial_number: row.serial_number,
+    serial_numbers: parseSerialNumbers(row.serial_number),
     // typed-cylinder historical fields — free-text brand+capacity rows
     brand_name: row.brand_name,
     model: row.model,

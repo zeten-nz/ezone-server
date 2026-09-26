@@ -244,6 +244,7 @@ app.use('/api/export-csv', exportCsvRoutes);
 // RETIRED (Beta-1 security decision): phone-based access to customer +
 // vehicle + installed-equipment data now requires authentication — see
 // GET /api/warranty/lookup in routes/warrantyRoutes.js.
+app.get('/api/export/client-warranty.xlsx', verifyToken, authorizeRole('ADMIN'), require('./controllers/clientWarrantyExportController').exportClientWarranty);
 app.get('/api/export/warranty', verifyToken, authorizeRole('ADMIN'), exportWarrantyForms);
 app.get('/api/export/branch',   verifyToken, authorizeRole('ADMIN'), exportByBranch);
 app.get('/api/export/employee', verifyToken, exportEmployeeData);

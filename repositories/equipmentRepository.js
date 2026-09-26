@@ -12,8 +12,8 @@ const ALL_EQUIPMENT_TYPES = ['REDUCER', 'CYLINDER', 'CONTROLLER', 'INJECTOR_RAIL
  * Upserts each equipment row keyed by (warranty_form_id, equipment_type) —
  * never delete-then-reinsert, which would wipe equipment_validation_status/
  * reward_points/etc. on rows the installer didn't even touch. If an update
- * changes product_id or serial_number, the validation/reward fields reset
- * back to PENDING/NULL (nothing has re-validated the new value yet). Not
+ * changes product_id or serial_number, the validation fields reset
+ * back to PENDING/NULL. Historical reward fields are preserved. Not
  * meaningfully exercised today since nothing sets those fields yet, but
  * wired now so the future validator integration doesn't need a redesign.
  */
@@ -35,10 +35,10 @@ const upsertMany = async (connection, warrantyFormId, equipmentRows) => {
     // by equipmentRepository.reviewVerification, never by this function) —
     // but a prior review must not silently linger attached to a row whose
     // underlying identity (product/barcode) just changed underneath it, so
-    // they reset alongside the existing dormant validation/reward fields on
+    // they reset alongside the existing dormant validation fields on
     // the exact same valueChanged trigger.
     const resetClause = (!existing || valueChanged)
-      ? `, equipment_validation_status = 'PENDING', validated_at = NULL, reward_points = NULL, reward_transaction_id = NULL, validation_response = NULL, reviewed_by = NULL, reviewed_at = NULL, review_notes = NULL`
+      ? `, equipment_validation_status = 'PENDING', validated_at = NULL, validation_response = NULL, reviewed_by = NULL, reviewed_at = NULL, review_notes = NULL`
       : '';
 
     // fuel_type is never written here — it's a per-warranty value now
@@ -154,10 +154,9 @@ const findByWarrantyFormIds = async (connection, formIds) => {
 /**
  * Deletes ONE equipment row by its safe composite key (Beta-3) — used
  * exclusively for removing an optional CYLINDER on warranty edit. Must run
- * inside the caller's transaction, after warrantyRepository.lockForm and
- * AFTER the row's points have been reversed (point_transactions'
- * warranty_equipment_id FK is ON DELETE SET NULL, so reversing after the
- * delete could no longer find the ledger rows). Deliberately NOT a generic
+ * inside the caller's transaction, after warrantyRepository.lockForm.
+ * Historical point ledger rows remain (their FK is ON DELETE SET NULL);
+ * warranty operations no longer award or reverse points. Not a generic
  * "delete whatever is missing" reconciliation — the bounded key keeps the
  * blast radius to exactly one row of one warranty.
  */
