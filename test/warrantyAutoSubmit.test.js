@@ -46,7 +46,7 @@ function stubSync({ submitImpl }) {
   const form = {
     id: 42, submission_uuid: 'u', warranty_book_number: 'W-1', installer_branch_code: '01/1', fuel_type: 'LPG',
     installer_full_name: 'F', installer_branch: 'B', organization_phone: '+998 90 111 22 33', installation_date: '2026-01-01',
-    installer_region: 'R', city: 'C', installer_district: 'D', car_id: null, vehicle_brand: 'VB', vehicle_model: 'VM',
+    installer_region: 'R', city: 'C', installer_district: 'D', car_id: null, vehicle_name: 'VB VM',
     vehicle_production_year: 2020, vehicle_vin: 'VIN', vehicle_mileage: 1, vehicle_plate_number: '01',
     owner_full_name: 'O', owner_phone: '+998 90 123 45 67',
   };
@@ -56,7 +56,7 @@ function stubSync({ submitImpl }) {
   eclient.submitWarranty = async () => { state.postCount += 1; return submitImpl(); };
   wrepo.updateEasyGasSyncResult = async (_c, _id, payload) => { state.recorded = payload; };
   const restore = () => { wrepo.findDetailById = orig.fd; wrepo.updateEasyGasSyncResult = orig.up; erepo.findByWarrantyFormIds = orig.eq; crepo.findById = orig.car; eclient.submitWarranty = orig.submit; };
-  const fakePool = { getConnection: async () => ({ release() {} }) };
+  const fakePool = { getConnection: async () => ({ release() {}, execute: async () => [[]] }) };
   return { state, restore, fakePool };
 }
 

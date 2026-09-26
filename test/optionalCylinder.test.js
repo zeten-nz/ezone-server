@@ -136,7 +136,7 @@ const FORM_ROW = {
   id: 77, submission_uuid: 'u-1', warranty_book_number: 'W-2026-000777', installer_branch_code: '01/1',
   fuel_type: 'LPG', installer_full_name: 'F', installer_branch: 'B', organization_phone: '+998983022844',
   installation_date: '2026-09-01', installer_region: 'R', city: 'C', installer_district: 'D', car_id: null,
-  vehicle_brand: 'VB', vehicle_model: 'VM', vehicle_production_year: 2021, vehicle_vin: 'VIN', vehicle_mileage: 1,
+  vehicle_name: 'VB VM', vehicle_production_year: 2021, vehicle_vin: 'VIN', vehicle_mileage: 1,
   vehicle_plate_number: '01A', owner_full_name: 'O', owner_phone: '+998901234567',
 };
 const payloadFor = async (equipmentRows) => {
@@ -149,7 +149,7 @@ const payloadFor = async (equipmentRows) => {
   crepo.findById = async () => null;
   eclient.submitWarranty = async (body) => { rawBody = body; return { ok: true, status: 201, data: { warranty: { claim_url: 'https://gasgo.uz/w/x' } }, networkError: false }; };
   try {
-    await syncSvc.syncWarrantyForm({ getConnection: async () => ({ release() {} }) }, 77);
+    await syncSvc.syncWarrantyForm({ getConnection: async () => ({ release() {}, execute: async () => [[]] }) }, 77);
   } finally {
     Object.assign(wrepo, { findDetailById: orig.fd, updateEasyGasSyncResult: orig.up });
     erepo.findByWarrantyFormIds = orig.eq; crepo.findById = orig.car; eclient.submitWarranty = orig.submit;
@@ -207,7 +207,7 @@ test('22.27/29 no-cylinder EasyGas FAILURE records FAILED and never throws/rolls
   crepo.findById = async () => null;
   eclient.submitWarranty = async () => ({ ok: false, status: 422, data: { errors: [] }, networkError: false });
   try {
-    await syncSvc.syncWarrantyForm({ getConnection: async () => ({ release() {} }) }, 77); // must not throw
+    await syncSvc.syncWarrantyForm({ getConnection: async () => ({ release() {}, execute: async () => [[]] }) }, 77); // must not throw
   } finally {
     Object.assign(wrepo, { findDetailById: orig.fd, updateEasyGasSyncResult: orig.up });
     erepo.findByWarrantyFormIds = orig.eq; crepo.findById = orig.car; eclient.submitWarranty = orig.submit;

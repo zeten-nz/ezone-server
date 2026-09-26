@@ -31,7 +31,10 @@ const SYNTHETIC_CLAIM_URL = 'https://admin.stag.uz/w/test-claim-token';
 // ── network guard: every fetch in this file must stay on loopback ──
 const fetchedUrls = [];
 const realFetch = global.fetch;
-global.fetch = (url, opts) => { fetchedUrls.push(String(url)); return realFetch(url, opts); };
+global.fetch = (url, opts) => {
+  assert.ok(['127.0.0.1', 'localhost', '[::1]'].includes(new URL(url).hostname), 'non-loopback network forbidden');
+  fetchedUrls.push(String(url)); return realFetch(url, opts);
+};
 
 // ── users known to verifyToken's DB re-check ──
 const USERS = {
@@ -112,14 +115,14 @@ const seqConn = (nextValue) => {
   };
 };
 
-test('N1 LPG warranty number: LPG-<year>-<NNNNNN>', async () => {
+test('N1 LPG warranty number: LPG-<YY>-<NNNNNN>', async () => {
   const conn = seqConn(10);
-  assert.equal(await wrepo.getNextWarrantyNumber(conn, 2026, 'LPG'), 'LPG-2026-000010');
+  assert.equal(await wrepo.getNextWarrantyNumber(conn, 2026, 'LPG'), 'LPG-26-000010');
 });
 
-test('N2 CNG warranty number: CNG-<year>-<NNNNNN>', async () => {
+test('N2 CNG warranty number: CNG-<YY>-<NNNNNN>', async () => {
   const conn = seqConn(11);
-  assert.equal(await wrepo.getNextWarrantyNumber(conn, 2026, 'CNG'), 'CNG-2026-000011');
+  assert.equal(await wrepo.getNextWarrantyNumber(conn, 2026, 'CNG'), 'CNG-26-000011');
 });
 
 test('N3 LPG and CNG draw from the SAME shared yearly sequence (identical SQL, year-only key, no per-fuel counter)', async () => {
@@ -131,6 +134,7 @@ test('N3 LPG and CNG draw from the SAME shared yearly sequence (identical SQL, y
   // formatted prefix, never which sequence row is incremented.
   assert.equal(connA.captured[0].sql, connB.captured[0].sql);
   assert.deepEqual(connA.captured[0].params, connB.captured[0].params);
+  assert.deepEqual(connA.captured[0].params, [2026]);
   assert.match(connA.captured[0].sql, /warranty_number_sequences \(year, last_number\)/);
   assert.ok(!/fuel/i.test(connA.captured[0].sql), 'sequence table must stay keyed by year alone');
 });
@@ -167,11 +171,11 @@ test('N6/N7 historical W- rows are never rewritten: no warranty_forms UPDATE tou
   }
 });
 
-test('N8 EasyGas payload forwards the new-format number VERBATIM (no reconstruction)', () => {
-  const payload = buildPayload(dbRow({ warranty_book_number: 'CNG-2026-000011' }), [], null);
-  assert.equal(payload.warranty_book_number, 'CNG-2026-000011');
-  const lpg = buildPayload(dbRow(), [], null);
-  assert.equal(lpg.warranty_book_number, 'LPG-2026-000010');
+test('N8 pure payload mapping forwards new and historical numbers verbatim (validation is separate)', () => {
+  for (const number of ['LPG-26-000010', 'CNG-26-000011', 'W-2026-000010', 'LPG-2026-000010', 'CNG-2026-000011']) {
+    const payload = buildPayload(dbRow({ warranty_book_number: number }), [], { carId: null, vehicleBrand: null, vehicleModel: null });
+    assert.equal(payload.warranty_book_number, number);
+  }
 });
 
 // ════════ Part A — QR lookup endpoint ════════
@@ -325,4 +329,13 @@ test('C19 submission_uuid replay → ZERO EasyGas POSTs, SAME stored number/clai
   assert.equal(res.body.id, 42);
   assert.equal(res.body.warranty_book_number, 'LPG-2026-000010'); // same number, never a second one
   assert.equal(res.body.easygas_claim_url, SYNTHETIC_CLAIM_URL);
+});
+
+test('generated numbers fit 14 characters and retain exactly six suffix digits', async () => {
+  for (const fuel of ['LPG', 'CNG']) {
+    const number = await wrepo.getNextWarrantyNumber(seqConn(999999), 2026, fuel);
+    assert.equal(number.length, 13);
+    assert.ok(number.length <= 14);
+    await assert.rejects(wrepo.getNextWarrantyNumber(seqConn(1000000), 2026, fuel), /warranty_number_out_of_range/);
+  }
 });

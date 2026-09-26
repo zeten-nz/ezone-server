@@ -49,8 +49,8 @@ const getEmployeeSnapshot = async (connection, employeeId) => {
  * using only the VALUES-clause literal would leave insertId wrong
  * (stale/0) on that first-of-the-year branch.
  *
- * Fuel-aware prefix (2026-09): new numbers are `LPG-2026-000010` /
- * `CNG-2026-000011` after the fuel type of the installation, replacing the
+ * Fuel-aware prefix (2026-09): new numbers are `LPG-26-000010` /
+ * `CNG-26-000011` after the fuel type of the installation, replacing the
  * old `W-` prefix for NEW warranties only — historical W-… rows are never
  * rewritten. ONE shared yearly sequence deliberately backs both prefixes
  * (the same warranty_number_sequences row per year): no per-fuel counters,
@@ -71,7 +71,13 @@ const getNextWarrantyNumber = async (connection, year, fuelType) => {
      ON DUPLICATE KEY UPDATE last_number = LAST_INSERT_ID(last_number + 1)`,
     [year]
   );
-  return `${fuelType}-${year}-${String(result.insertId).padStart(6, '0')}`;
+  const suffix = String(result.insertId);
+  const number = `${fuelType}-${String(year).slice(-2)}-${suffix.padStart(6, '0')}`;
+  // Fail inside the caller's transaction rather than issue an invalid number.
+  if (!/^[1-9]\d{0,5}$/.test(suffix) || number.length > 14) {
+    throw new Error('warranty_number_out_of_range');
+  }
+  return number;
 };
 
 const insert = async (connection, employeeId, snapshot, data, warrantyBookNumber) => {

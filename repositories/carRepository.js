@@ -40,6 +40,22 @@ const findById = async (connection, carId) => {
   return rows[0] || null;
 };
 
+const normalizeVehicleText = (value) => String(value ?? '').trim().replace(/\s+/g, ' ');
+
+// Compare in JS so whitespace/case normalization is independent of DB collation.
+// No LIMIT: uniqueness must be checked against the entire active catalog.
+const findActiveExactMatch = async (connection, vehicleName) => {
+  const key = normalizeVehicleText(vehicleName).toLowerCase();
+  if (!key) return null;
+  const [rows] = await connection.execute(
+    'SELECT id, external_id, brand, model FROM cars WHERE is_active = TRUE'
+  );
+  const full = rows.filter((car) => normalizeVehicleText(`${car.brand} ${car.model}`).toLowerCase() === key);
+  if (full.length) return full.length === 1 ? full[0] : null;
+  const models = rows.filter((car) => normalizeVehicleText(car.model).toLowerCase() === key);
+  return models.length === 1 ? models[0] : null;
+};
+
 const create = async (connection, { brand, model }) => {
   const [result] = await connection.execute(
     'INSERT INTO cars (brand, model) VALUES (?, ?)',
@@ -59,4 +75,4 @@ const setActive = async (connection, carId, isActive) => {
   await connection.execute('UPDATE cars SET is_active = ? WHERE id = ?', [isActive, carId]);
 };
 
-module.exports = { findAllPaginated, search, findById, create, update, setActive };
+module.exports = { findAllPaginated, search, findById, findActiveExactMatch, normalizeVehicleText, create, update, setActive };

@@ -1,10 +1,7 @@
 /**
  * Builds the EasyGas payload for one warranty and submits it — called
- * exactly once, only after warrantyService.reviewWarrantyForm has already
- * committed that warranty's status to SUCCESSFUL (see that function; never
- * called from anywhere else). Field mapping matches the contract confirmed
- * in the standalone test-easygas.js verification, applied to a real
- * warranty row instead of a fabricated sample.
+ * after local creation/review commits SUCCESSFUL, or on explicit operator
+ * retry. Remote failure never changes the local warranty status.
  *
  * Field-source decisions, documented at the exact line that uses each below:
  *   - branch_stag_code: LOCAL branches are authoritative (FINAL architecture
@@ -24,10 +21,8 @@
  *   - components[].product_id: EasyGas's own catalog id — prefers the synced
  *     products.external_id, local-id fallback only when external_id is
  *     absent (documented fallback, not the norm).
- *   - car_id: same resolution as product_id, added when it was discovered
- *     this field was still sending the raw local `cars.id` (an internal
- *     auto-increment PK EasyGas has never seen) instead of the synced
- *     `cars.external_id`.
+ *   - car_id: ONLY cars.external_id. Otherwise the catalog or conservative
+ *     free text supplies brand/model. Local IDs never cross this boundary.
  *   - owner_phone / organization_phone: canonicalized formatting-only
  *     (toEasyGasPhone) then validated against EasyGas's +998XXXXXXXXX shape
  *     immediately before the POST (see the guard in syncWarrantyForm) —
@@ -129,7 +124,46 @@ const toEasyGasPhone = (value) => {
   return null;
 };
 
-const buildPayload = (form, equipment, carExternalId) => ({
+const validExternalCarId = (value) => Number.isSafeInteger(value) && value > 0;
+
+const resolveEasyGasVehicle = async (connection, form) => {
+  let car = form.car_id != null ? await carRepository.findById(connection, form.car_id) : null;
+  let source = 'selected';
+  if (!car) {
+    car = await carRepository.findActiveExactMatch(connection, form.vehicle_name);
+    source = 'catalog_exact';
+  }
+  if (car) {
+    const externalId = car.external_id != null ? Number(car.external_id) : null;
+    return {
+      carId: validExternalCarId(externalId) ? externalId : null,
+      vehicleBrand: carRepository.normalizeVehicleText(car.brand) || null,
+      vehicleModel: carRepository.normalizeVehicleText(car.model) || null,
+      source,
+    };
+  }
+  const name = carRepository.normalizeVehicleText(form.vehicle_name);
+  const [brand, ...model] = name.split(' ');
+  if (brand && model.length) {
+    return { carId: null, vehicleBrand: brand, vehicleModel: model.join(' '), source: 'free_text' };
+  }
+  return { carId: null, vehicleBrand: null, vehicleModel: null, source: 'unresolved' };
+};
+
+const validatePayload = (payload) => {
+  if (typeof payload.warranty_book_number !== 'string'
+      || !payload.warranty_book_number.trim() || payload.warranty_book_number.length > 14) {
+    return 'invalid_warranty_book_number: expected non-empty string of at most 14 characters';
+  }
+  if (!validExternalCarId(payload.car_id)
+      && !(typeof payload.vehicle_brand === 'string' && payload.vehicle_brand.trim()
+        && typeof payload.vehicle_model === 'string' && payload.vehicle_model.trim())) {
+    return 'vehicle_identity_unresolved: no EasyGas car_id and vehicle_brand/vehicle_model could not be resolved';
+  }
+  return null;
+};
+
+const buildPayload = (form, equipment, resolvedVehicle) => ({
   submission_uuid: form.submission_uuid,
   warranty_book_number: form.warranty_book_number,
   branch_stag_code: form.installer_branch_code,
@@ -141,16 +175,10 @@ const buildPayload = (form, equipment, carExternalId) => ({
   region: form.installer_region,
   city: form.city,
   district: form.installer_district,
-  // Prefers the synced EasyGas catalog id (cars.external_id) — same
-  // resolution as components[].product_id below, and for the same reason:
-  // form.car_id alone is our own local auto-increment PK, never something
-  // EasyGas issued. Falls back to the local id only when the car has no
-  // external_id yet (or form.car_id is null — the free-text vehicle_brand/
-  // vehicle_model fields above are always the valid fallback in that case,
-  // exactly as before this fix).
-  car_id: carExternalId != null ? carExternalId : form.car_id,
-  vehicle_brand: form.vehicle_brand,
-  vehicle_model: form.vehicle_model,
+  // Vehicle identity was explicitly resolved before this pure mapping.
+  car_id: resolvedVehicle.carId,
+  vehicle_brand: resolvedVehicle.vehicleBrand,
+  vehicle_model: resolvedVehicle.vehicleModel,
   vehicle_production_year: form.vehicle_production_year,
   vehicle_vin: form.vehicle_vin,
   vehicle_mileage: form.vehicle_mileage,
@@ -183,13 +211,16 @@ const syncWarrantyForm = async (pool, formId) => {
   try {
     const form = await warrantyRepository.findDetailById(connection, formId);
     const [withEquipment] = await attachEquipment(connection, [form]);
-    // See buildPayload's car_id comment — resolves the synced EasyGas
-    // catalog id before payload construction so buildPayload itself can
-    // stay a pure function. Reuses the existing carRepository.findById
-    // (unmodified) rather than adding a JOIN to findDetailById's shared
-    // query, which many unrelated warranty read paths also depend on.
-    const car = form.car_id ? await carRepository.findById(connection, form.car_id) : null;
-    const carExternalId = car?.external_id != null ? Number(car.external_id) : null;
+    // Resolve persisted local vehicle data before constructing the payload.
+    const resolvedVehicle = await resolveEasyGasVehicle(connection, form);
+    const payload = buildPayload(form, withEquipment.equipment, resolvedVehicle);
+    const contractError = validatePayload(payload);
+    if (contractError) {
+      await warrantyRepository.updateEasyGasSyncResult(connection, formId, {
+        result: 'FAILED', claimUrl: null, error: contractError,
+      });
+      return;
+    }
 
     // Pre-POST phone guard — the payload's phones must be +998XXXXXXXXX
     // exactly (same PHONE_REGEX authRoutes already enforces for
@@ -219,8 +250,9 @@ const syncWarrantyForm = async (pool, formId) => {
 
     // The payload carries the canonicalized values (the exact strings just
     // validated) — the stored row itself is untouched.
-    const normalizedForm = { ...form, owner_phone: ownerPhone, organization_phone: organizationPhone };
-    const rawBody = JSON.stringify(buildPayload(normalizedForm, withEquipment.equipment, carExternalId)); // serialized exactly once
+    payload.owner_phone = ownerPhone;
+    payload.organization_phone = organizationPhone;
+    const rawBody = JSON.stringify(payload); // serialized exactly once
 
     const result = await easyGasWarrantyClient.submitWarranty(rawBody);
 
@@ -245,4 +277,4 @@ const syncWarrantyForm = async (pool, formId) => {
   }
 };
 
-module.exports = { syncWarrantyForm, buildPayload };
+module.exports = { syncWarrantyForm, buildPayload, resolveEasyGasVehicle, validatePayload };
