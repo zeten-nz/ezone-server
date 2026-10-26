@@ -80,6 +80,10 @@ const getNextWarrantyNumber = async (connection, year, fuelType) => {
   return number;
 };
 
+// NULL only when the installer explicitly ticked "phone unavailable" (route
+// validation guarantees a valid phone otherwise).
+const ownerPhoneOrNull = (data) => (data.owner_phone_unavailable === true ? null : data.owner_phone);
+
 const insert = async (connection, employeeId, snapshot, data, warrantyBookNumber) => {
   const [result] = await connection.execute(
     // status is created SUCCESSFUL (literal): admin approval is no longer a stage — a new warranty is final on
@@ -97,7 +101,7 @@ const insert = async (connection, employeeId, snapshot, data, warrantyBookNumber
       snapshot.full_name, snapshot.installer_phone || null, snapshot.branch_code,
       data.submission_uuid, warrantyBookNumber, data.installation_date, data.fuel_type,
       data.vehicle_name, data.car_id || null, data.vehicle_production_year, data.vehicle_plate_number || null, data.vehicle_vin, data.vehicle_mileage,
-      data.owner_full_name, data.owner_phone,
+      data.owner_full_name, ownerPhoneOrNull(data),
     ]
   );
   return result.insertId;
@@ -124,7 +128,7 @@ const update = async (connection, formId, data) => {
     [
       data.installation_date, data.fuel_type,
       data.vehicle_name, data.car_id || null, data.vehicle_production_year, data.vehicle_plate_number || null, data.vehicle_vin, data.vehicle_mileage,
-      data.owner_full_name, data.owner_phone,
+      data.owner_full_name, ownerPhoneOrNull(data),
       formId,
     ]
   );

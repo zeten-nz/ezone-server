@@ -584,6 +584,10 @@ const initializeDatabase = async (loadMockData = false) => {
     // nullable at the schema level only because historical rows predate
     // that mechanism.
     await ensureNullableColumn(connection, 'warranty_forms', 'warranty_book_number', 'warranty_book_number VARCHAR(100) NULL');
+    // owner_phone: NULL = the owner's phone genuinely isn't known (old paper
+    // warranty-book customers entered retroactively). Set only via the
+    // explicit "phone unavailable" checkbox, never by leaving the field blank.
+    await ensureNullableColumn(connection, 'warranty_forms', 'owner_phone', 'owner_phone VARCHAR(20) NULL');
     // submission_uuid: this warranty's own create-idempotency key (protects
     // against a client retrying a POST it doesn't know already succeeded) —
     // no external integration involved.

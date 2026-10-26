@@ -234,10 +234,13 @@ const syncWarrantyForm = async (pool, formId) => {
     // here, never reaching EasyGas: recorded as FAILED with a
     // machine-readable `invalid_phone:` prefix (surfaced to the admin via
     // easygas_sync_error, same as every other sync failure), no POST sent.
-    const ownerPhone = toEasyGasPhone(form.owner_phone);
+    // A NULL owner_phone is the explicit "phone unavailable" case (old paper
+    // warranty-book customers) — sent as JSON null, not validated.
+    const ownerPhoneUnavailable = form.owner_phone == null;
+    const ownerPhone = ownerPhoneUnavailable ? null : toEasyGasPhone(form.owner_phone);
     const organizationPhone = toEasyGasPhone(form.organization_phone);
     const invalidPhones = [];
-    if (!ownerPhone || !PHONE_REGEX.test(ownerPhone)) invalidPhones.push('owner_phone');
+    if (!ownerPhoneUnavailable && (!ownerPhone || !PHONE_REGEX.test(ownerPhone))) invalidPhones.push('owner_phone');
     if (!organizationPhone || !PHONE_REGEX.test(organizationPhone)) invalidPhones.push('organization_phone');
     if (invalidPhones.length > 0) {
       await warrantyRepository.updateEasyGasSyncResult(connection, formId, {

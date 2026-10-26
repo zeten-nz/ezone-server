@@ -73,7 +73,13 @@ const warrantyValidationRules = [
   // authRoutes already enforces for registration; rows created before this
   // rule are additionally guarded at sync time (syncWarrantyForm's pre-POST
   // phone check) so a legacy shape can still never reach EasyGas.
-  body('owner_phone').notEmpty().matches(PHONE_REGEX).withMessage('A valid Uzbekistan phone number is required (+998XXXXXXXXX)'),
+  // Exception: owner_phone_unavailable === true (old paper-book customers with
+  // no known number) stores NULL instead — the phone is then ignored, never
+  // required; leaving the field blank WITHOUT the flag is still rejected.
+  body('owner_phone_unavailable').optional({ nullable: true }).isBoolean().withMessage('owner_phone_unavailable must be a boolean'),
+  body('owner_phone')
+    .if((value, { req }) => req.body.owner_phone_unavailable !== true)
+    .notEmpty().matches(PHONE_REGEX).withMessage('A valid Uzbekistan phone number is required (+998XXXXXXXXX)'),
   // Beta-3: CYLINDER is optional — 3 rows (Reducer/Controller/Injector
   // Rail) or 4 (plus Cylinder). Count alone is only a shape check; the
   // authoritative invariant (each required type exactly once, cylinder
