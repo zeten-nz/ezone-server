@@ -78,7 +78,12 @@ const warrantyValidationRules = [
   // required; leaving the field blank WITHOUT the flag is still rejected.
   body('owner_phone_unavailable').optional({ nullable: true }).isBoolean().withMessage('owner_phone_unavailable must be a boolean'),
   body('owner_phone')
-    .if((value, { req }) => req.body.owner_phone_unavailable !== true)
+    // A custom .if() condition stops the chain only by THROWING — returning
+    // false would let the phone rules run anyway.
+    .if((value, { req }) => {
+      if (req.body.owner_phone_unavailable === true) throw new Error('phone not required');
+      return true;
+    })
     .notEmpty().matches(PHONE_REGEX).withMessage('A valid Uzbekistan phone number is required (+998XXXXXXXXX)'),
   // Beta-3: CYLINDER is optional — 3 rows (Reducer/Controller/Injector
   // Rail) or 4 (plus Cylinder). Count alone is only a shape check; the
